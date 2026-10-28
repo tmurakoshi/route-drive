@@ -136,6 +136,8 @@
   <button class="item" data-act="new">＋ 新しいルートを作る</button>
   <button class="item" data-act="rename">名前を変更</button>
   <button class="item" data-act="share">ルートを共有（リンクを作る）</button>
+  <button class="item" data-act="import">ルートを読み込む（GPX / GeoJSON）</button>
+  <input type="file" id="importFile" accept=".gpx,.geojson,.json,application/gpx+xml,application/geo+json,application/json" style="display:none">
   <button class="item" data-act="export">書き出し…</button>
   <button class="item" data-act="sim">シミュレーション走行（机上テスト）</button>
   <label>音声案内（右左折を読み上げ。ルートを外れたら自動で引き直し）</label>
@@ -184,7 +186,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
 'use strict';
-const VERSION = '2026-10-27.3';
+const VERSION = '2026-10-28.1';
 document.getElementById('ver').textContent = VERSION;
 const STEP_M = 15;            // ルートをこの長さの区間に分割して通過判定する
 // 経路計算サーバー（無料のデモ）。車は一方通行・進入禁止を守る。徒歩は無視して最短で結ぶ
@@ -707,6 +709,89 @@ async function importFromURL(){
   return true;
 }
 
+/* ---------- ファイルからルートを読み込む（GPX / GeoJSON） ---------- */
+const MAX_IMPORT_WP = 60; // 経路サーバーに渡す経由地の上限（多いほど元の線に忠実、少ないほど編集しやすい）
+// 戻り値 { name, points:[[lat,lon],...], kind:'rte'|'trk'|'wpt'|'line'|'point', count }
+function parseImportText(text, filename){
+  const base = (filename || 'ルート').replace(/\.[^.]+$/, '');
+  const ok = p => p.length === 2 && p.every(n => isFinite(n)) && Math.abs(p[0]) <= 90 && Math.abs(p[1]) <= 180;
+  if (/^\s*</.test(text)){
+    const doc = new DOMParser().parseFromString(text, 'application/xml');
+    if (doc.querySelector('parsererror')) throw new Error('GPX の形式が壊れています');
+    const pts = sel => [...doc.querySelectorAll(sel)].map(e => [parseFloat(e.getAttribute('lat')), parseFloat(e.getAttribute('lon'))]).filter(ok);
+    const nameOf = el => { const n = el && el.querySelector(':scope > name'); return n && n.textContent.trim(); };
+    const rte = doc.querySelector('rte'), trk = doc.querySelector('trk');
+    if (rte && rte.querySelectorAll('rtept').length >= 2) return { name: nameOf(rte) || base, points: pts('rte:first-of-type rtept'), kind: 'rte', count: doc.querySelectorAll('rte').length };
+    if (trk && trk.querySelectorAll('trkpt').length >= 2) return { name: nameOf(trk) || base, points: pts('trk:first-of-type trkpt'), kind: 'trk', count: doc.querySelectorAll('trk').length };
+    const w = pts('wpt'); if (w.length >= 2) return { name: base, points: w, kind: 'wpt', count: 1 };
+    throw new Error('GPX に線（rte / trk）も地点（wpt）も見つかりません');
+  }
+  let j; try { j = JSON.parse(text); } catch(e){ throw new Error('GPX でも JSON でもありません'); }
+  const feats = j.type === 'FeatureCollection' ? j.features : j.type === 'Feature' ? [j] : [{ type: 'Feature', properties: {}, geometry: j }];
+  const lines = [], points = []; let name = j.name || '';
+  for (const f of feats || []){
+    const g = f && f.geometry; if (!g) continue;
+    const nm = f.properties && (f.properties.name || f.properties.route);
+    const push = coords => { const l = coords.map(c => [c[1], c[0]]).filter(ok); if (l.length >= 2){ lines.push(l); if (!name && nm) name = nm; } };
+    if (g.type === 'LineString') push(g.coordinates);
+    else if (g.type === 'MultiLineString') g.coordinates.forEach(push);
+    else if (g.type === 'Point'){ const p = [g.coordinates[1], g.coordinates[0]]; if (ok(p)) points.push(p); }
+    else if (g.type === 'MultiPoint') g.coordinates.forEach(c => { const p = [c[1], c[0]]; if (ok(p)) points.push(p); });
+  }
+  if (lines.length){
+    // 複数の線は順に連結（このアプリが書き出した 3 ファイルの「走行済」「未走行」など）
+    return { name: name || base, points: lines.flat(), kind: 'line', count: lines.length };
+  }
+  if (points.length >= 2) return { name: name || base, points, kind: 'point', count: 1 };
+  throw new Error('GeoJSON に LineString / Point が見つかりません');
+}
+// Douglas-Peucker で間引く（tol: m）。元の線の形を保ったまま点数を減らす
+function simplifyIdx(points, tol){ // 残す点の添字を返す
+  const o = points[0], xy = points.map(p => toXY(p[0], p[1], o));
+  const keep = new Uint8Array(points.length); keep[0] = keep[points.length-1] = 1;
+  const stack = [[0, points.length-1]];
+  while (stack.length){
+    const [a, b] = stack.pop(); let maxD = -1, idx = -1;
+    for (let i = a+1; i < b; i++){ const d = distPointSeg(xy[i], xy[a], xy[b]); if (d > maxD){ maxD = d; idx = i; } }
+    if (maxD > tol){ keep[idx] = 1; stack.push([a, idx], [idx, b]); }
+  }
+  const out = []; keep.forEach((k, i) => { if (k) out.push(i); }); return out;
+}
+function thinToWaypoints(points, maxN){
+  // 近すぎる連続点（3m 未満）を落としてから間引く
+  const p = points.filter((q, i) => i === 0 || haversine(points[i-1], q) >= 3);
+  if (p.length <= 2) return p;
+  let tol = 5, idx = simplifyIdx(p, tol);
+  while (idx.length > maxN + 1 && tol < 5000){ tol *= 1.5; idx = simplifyIdx(p, tol); }
+  // 間引きで残るのは「曲がり角」。角そのものを経由地にすると経路サーバーが右左折を
+  // 経由地の到着/出発として扱い案内が消えるので、角と角の中間（直線部分の中ほど）を経由地にする
+  const out = [p[0]];
+  for (let k = 0; k + 1 < idx.length; k++){
+    const a = idx[k], b = idx[k+1];
+    if (b - a >= 2){ const m = p[Math.floor((a + b) / 2)]; if (haversine(out[out.length-1], m) >= 10) out.push(m); }
+  }
+  const last = p[p.length-1]; if (haversine(out[out.length-1], last) >= 10) out.push(last); else out[out.length-1] = last;
+  return out;
+}
+async function importRouteFromText(text, filename){
+  const parsed = parseImportText(text, filename);
+  if (parsed.points.length < 2) throw new Error('点が 2 つ以上必要です');
+  const wps = thinToWaypoints(parsed.points, MAX_IMPORT_WP);
+  if (wps.length < 2) throw new Error('距離が短すぎてルートにできません');
+  const r = newRoute(parsed.name); r.waypoints = wps; routes.push(r); await DB.putRoute(r);
+  await selectRoute(r.id, false);
+  const note = parsed.count > 1 ? `（ファイル内の線 ${parsed.count} 本を${parsed.kind === 'line' ? '連結' : 'のうち最初の 1 本を使用'}）` : '';
+  toast(`「${parsed.name}」を読み込みました${note}。元の ${parsed.points.length} 点 → 経由地 ${wps.length} 点で道路ルートを計算中…`, 5000);
+  await doRecompute();
+  if (cur === r){ setMode('edit'); if (r.geometry.length > 1) map.fitBounds(L.latLngBounds(r.geometry), { padding: [40, 40] }); }
+  return r;
+}
+$('importFile').onchange = async e => {
+  const f = e.target.files && e.target.files[0]; if (!f) return;
+  try { await importRouteFromText(await f.text(), f.name); }
+  catch (err){ toast('読み込めませんでした: ' + err.message, 5000); }
+};
+
 /* ---------- 書き出し ---------- */
 async function shareFile(name, text, type){
   const blob = new Blob([text], { type });
@@ -817,6 +902,7 @@ $('menu').onclick = async e => {
     case 'new': $('menu').classList.remove('open'); await createRoute(); return;
     case 'rename': { const n = prompt('ルート名', cur.name); if (n && n.trim()){ cur.name = n.trim(); await persist(); refreshSelect(); } break; }
     case 'share': await shareRoute(); break;
+    case 'import': $('menu').classList.remove('open'); $('importFile').value = ''; $('importFile').click(); return;
     case 'export': $('menu').classList.remove('open'); $('exportSheet').classList.add('open'); return;
     case 'sim': $('simSheet').classList.add('open'); return;
     case 'reset': if (confirm('走行記録（通過済み・軌跡）を消して未走行に戻しますか？')){ cur.segs.forEach(s => s.c = 0); await DB.clearTrack(cur.id); trackLine.setLatLngs([]); await persist(); renderCovered(); } break;
