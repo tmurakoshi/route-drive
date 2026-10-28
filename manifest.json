@@ -1,0 +1,13 @@
+{
+  "name": "ルート走行チェック",
+  "short_name": "ルート走行",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#101418",
+  "theme_color": "#101418",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}
