@@ -189,7 +189,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
 'use strict';
-const VERSION = '2026-11-02.2';
+const VERSION = '2026-11-02.3';
 document.getElementById('ver').textContent = VERSION;
 const STEP_M = 15;            // ルートをこの長さの区間に分割して通過判定する
 // 経路計算サーバー（無料のデモ）。車は一方通行・進入禁止を守る。徒歩は無視して最短で結ぶ
@@ -242,9 +242,43 @@ const DB = {
 
 /* ---------- 幾何 ---------- */
 const R = 6371000;
+// 同じ道を 2 回通るルート（往復・周回）向けの判定と表示の定数
+const COV = {
+  offsetM: 6,     // 表示: ルート線を進行方向の左側にずらす距離 (m)。判定には使わない
+  dirTolDeg: 60,  // 判定: 走行方向と区間の向きの差がこの角度以内の区間だけ通過済みにする
+  back: 100,      // 判定: ルート上の現在位置からこの距離だけ後ろまでを対象にする (m)
+  ahead: 150,     // 判定: 同じく前方 (m)
+  moveMin: 3,     // 判定: これ未満しか動いていないときは停止中とみなし、前回位置と向きを更新しない (m)
+  dirBase: 15,    // 判定: GPS の進行方位が無いとき、向きの推定に使う基線の長さ (m)。短いとゆらぎで向きが暴れる
+  trailN: 5,      // 判定: 判定線に使う直近の位置の数
+};
 function toXY(lat, lon, o){ // 原点 o 基準のローカル平面座標 (m)
   const k = Math.PI / 180;
   return [ (lon - o[1]) * k * R * Math.cos(o[0] * k), (lat - o[0]) * k * R ];
+}
+function fromXY(x, y, o){ // toXY の逆変換
+  const k = Math.PI / 180;
+  return [ o[0] + y / (k * R), o[1] + x / (k * R * Math.cos(o[0] * k)) ];
+}
+// 折れ線を進行方向の左側へ d (m) 平行移動した折れ線を返す（表示専用）。角では隣り合う辺の法線を平均する
+function offsetLine(latlngs, d){
+  if (!d || latlngs.length < 2) return latlngs;
+  const o = latlngs[0], xy = latlngs.map(q => toXY(q[0], q[1], o)), n = xy.length;
+  const normal = i => { const vx = xy[i+1][0]-xy[i][0], vy = xy[i+1][1]-xy[i][1], l = Math.hypot(vx, vy) || 1; return [-vy/l, vx/l]; }; // 左向き法線
+  const out = [];
+  for (let i = 0; i < n; i++){
+    let nx, ny;
+    if (i === 0){ [nx, ny] = normal(0); }
+    else if (i === n-1){ [nx, ny] = normal(n-2); }
+    else {
+      const a = normal(i-1), b = normal(i); nx = a[0]+b[0]; ny = a[1]+b[1];
+      const l = Math.hypot(nx, ny);
+      if (l < 1e-6){ [nx, ny] = b; } // 折り返し(180°)は片側の法線
+      else { const cosHalf = Math.max(0.5, l / 2); nx = nx / l / cosHalf; ny = ny / l / cosHalf; } // マイター（伸びは 2 倍まで）
+    }
+    out.push(fromXY(xy[i][0] + nx * d, xy[i][1] + ny * d, o));
+  }
+  return out;
 }
 function haversine(a, b){
   const k = Math.PI / 180, dLat = (b[0]-a[0])*k, dLon = (b[1]-a[1])*k;
@@ -386,7 +420,7 @@ function initMap(){
 function setFollow(on){ settings.follow = on; saveSettings(); $('followBtn').classList.toggle('on', on); if (on && lastFix) map.panTo(lastFix.ll); }
 
 function renderRoute(fit){
-  routeLine.setLatLngs(cur ? cur.geometry : []);
+  routeLine.setLatLngs(cur ? offsetLine(cur.geometry, COV.offsetM) : []);
   wpLayer.clearLayers();
   if (cur) cur.waypoints.forEach((wp, i) => {
     const cls = 'wp-icon' + (i === 0 ? ' first' : (i === cur.waypoints.length-1 && i > 0 ? ' last' : ''));
@@ -402,7 +436,7 @@ function renderCovered(){
   coveredLayer.clearLayers();
   if (!cur) { updateStats(); return; }
   let run = [];
-  const flush = () => { if (run.length > 1) L.polyline(run, { color: '#30a46c', weight: 7, opacity: 1 }).addTo(coveredLayer); run = []; };
+  const flush = () => { if (run.length > 1) L.polyline(offsetLine(run, COV.offsetM), { color: '#30a46c', weight: 7, opacity: 1 }).addTo(coveredLayer); run = []; };
   for (const s of cur.segs){
     if (s.c){ if (!run.length) run.push(s.a); run.push(s.b); } else flush();
   }
@@ -470,6 +504,7 @@ function ensureSegXY(){
   const o = cur.geometry[0], cum = []; let acc = 0;
   for (const s of cur.segs){ cum.push(acc); acc += s.len; }
   segXY = { o, a: cur.segs.map(s => toXY(s.a[0], s.a[1], o)), b: cur.segs.map(s => toXY(s.b[0], s.b[1], o)), cum };
+  segXY.dir = segXY.a.map((a, i) => Math.atan2(segXY.b[i][1]-a[1], segXY.b[i][0]-a[0])); // 区間の向き (rad)
   mainG = makeGuide(cur.geometry, cur.nav || []);
 }
 
@@ -504,16 +539,34 @@ function progOn(g, i, p){
   return g.cum[i] + t * Math.sqrt(l2);
 }
 // 経路上の現在位置(先頭からの距離)。往復で同じ道を通る場合は前回位置から前に進む候補を優先する
-function locate(g, p, prevProg){
+function locate(g, p, prevProg, preferUncovered){
   if (!g || g.xy.length < 2) return { d: Infinity, prog: null };
   let minD = Infinity, best = -1; const ds = new Array(g.xy.length - 1);
   for (let i = 0; i + 1 < g.xy.length; i++){ const d = distPointSeg(p, g.xy[i], g.xy[i+1]); ds[i] = d; if (d < minD){ minD = d; best = i; } }
-  if (prevProg != null){
-    let bestScore = Infinity;
+  if (prevProg == null && preferUncovered && segXY){
+    // 初回の位置決め: 近い候補が複数あるとき（往復・周回で同じ道を通る）、まだ通過していない区間のうち一番手前を選ぶ。
+    // 全部通過済みなら一番手前。出発地＝到着地のルートで終点側と判定されるのを防ぐ
+    let first = -1, firstUncovered = -1;
     for (let i = 0; i + 1 < g.xy.length; i++) if (ds[i] <= minD + 20){
-      const pr = progOn(g, i, p), score = pr >= prevProg - 30 ? pr - prevProg + 30 : (prevProg - pr) * 3;
-      if (score < bestScore){ bestScore = score; best = i; }
+      if (first < 0) first = i;
+      if (firstUncovered < 0 && !cur.segs[segIndexAtProg(progOn(g, i, p))].c){ firstUncovered = i; break; }
     }
+    best = firstUncovered >= 0 ? firstUncovered : first;
+  }
+  if (prevProg != null){
+    // 近い候補が複数あるとき（往復・周回で同じ道を通る）の選び方:
+    //  1) 前回位置から 500m 以内の前進候補があればその中で一番近いもの（わずかな後退はゆらぎとして許容、ただし前進より不利）
+    //  2) なければ一番後退が少ないもの（運転者が実際に引き返した場合）
+    //  3) それもなければ遠くの前進候補
+    // 同じ道を逆向きに通る区間で一度「逆走」と誤判定しても、次の fix で前進候補が優先されるので自然に戻る
+    let fwd = -1, fwdScore = Infinity, back = -1, backScore = Infinity, far = -1, farScore = Infinity;
+    for (let i = 0; i + 1 < g.xy.length; i++) if (ds[i] <= minD + 20){
+      const delta = progOn(g, i, p) - prevProg;
+      if (delta >= -5 && delta <= 500){ const sc = delta >= 0 ? delta : 10 - delta * 3; if (sc < fwdScore){ fwdScore = sc; fwd = i; } }
+      else if (delta < -5){ if (-delta < backScore){ backScore = -delta; back = i; } }
+      else if (delta < farScore){ farScore = delta; far = i; }
+    }
+    best = fwd >= 0 ? fwd : back >= 0 ? back : far >= 0 ? far : best;
   }
   return { d: ds[best], prog: progOn(g, best, p) };
 }
@@ -611,7 +664,7 @@ function speak(text){
   const v = pickVoice(); if (v) u.voice = v;
   speechSynthesis.cancel(); speechSynthesis.speak(u);
 }
-let prevXY = null, dirty = false;
+let trail = [], moveDir = null, dirty = false; // trail: 直近の位置(平面座標)
 function onFix(lat, lon, acc, heading, speed, ts, isSim){
   const ll = [lat, lon];
   lastFix = { ll, acc, ts };
@@ -628,23 +681,42 @@ function onFix(lat, lon, acc, heading, speed, ts, isSim){
   if (!isSim) DB.addTrack({ routeId: cur.id, t: ts, lat, lon, acc, spd: speed }).catch(()=>{});
   const tl = trackLine.getLatLngs(); if (tl.length > 5000) tl.shift(); tl.push(ll); trackLine.setLatLngs(tl);
 
-  if (acc > 80) { prevXY = null; return; } // 精度が悪すぎる位置では判定しない
+  if (acc > 80) { trail = []; moveDir = null; return; } // 精度が悪すぎる位置では判定しない
   ensureSegXY();
   const p = toXY(lat, lon, segXY.o);
   const thr = settings.thr;
-  // 前回位置から今回位置までの移動線分と、各区間の中点との距離で判定（取りこぼし防止）
-  const usePrev = prevXY && Math.hypot(prevXY[0]-p[0], prevXY[1]-p[1]) < 300;
+  // 直近の軌跡（moveMin 以上動いたときだけ追加。停止中は据え置き）。位置が 300m 以上飛んだら仕切り直し
+  const moved = trail.length ? Math.hypot(p[0]-trail[trail.length-1][0], p[1]-trail[trail.length-1][1]) : Infinity;
+  if (moved >= 300){ trail = []; moveDir = null; }
+  const advanced = !trail.length || moved >= COV.moveMin;
+  // 走行方向: 動いているときは GPS の進行方位(精度が良い)を優先、なければ直近 dirBase m 以上前の軌跡点からの向き
+  if (heading != null && !isNaN(heading) && speed > 2) moveDir = (90 - heading) * Math.PI / 180; // 北0°時計回り → 数学角
+  else if (advanced && trail.length){
+    let k = trail.length - 1; while (k > 0 && Math.hypot(p[0]-trail[k][0], p[1]-trail[k][1]) < COV.dirBase) k--;
+    const q = trail[k]; if (Math.hypot(p[0]-q[0], p[1]-q[1]) >= COV.moveMin) moveDir = Math.atan2(p[1]-q[1], p[0]-q[0]);
+  }
+  // 判定線: 直近の軌跡＋今回位置の折れ線。前回ゆらぎで弾いた区間も次の fix で拾える
+  const path = trail.concat([p]);
+  // ルート上の現在位置。ルートに乗っているときは、その前後の区間だけを判定対象にする（同じ向きで 2 回通る区間の 2 回目を残す）
+  const mainLoc = locate(mainG, p, mainProg, true);
+  const onRoute = mainLoc.prog != null && mainLoc.d <= Math.max(50, thr * 2);
+  const lo = onRoute ? segIndexAtProg(mainLoc.prog - COV.back) : 0;
+  const hi = onRoute ? segIndexAtProg(mainLoc.prog + COV.ahead) : cur.segs.length - 1;
+  const tol = COV.dirTolDeg * Math.PI / 180;
   let minD = Infinity, changed = false;
   for (let i = 0; i < cur.segs.length; i++){
-    const s = cur.segs[i], mx = (segXY.a[i][0]+segXY.b[i][0])/2, my = (segXY.a[i][1]+segXY.b[i][1])/2;
-    const d = usePrev ? distPointSeg([mx,my], prevXY, p) : Math.hypot(mx-p[0], my-p[1]);
+    const s = cur.segs[i], m = [(segXY.a[i][0]+segXY.b[i][0])/2, (segXY.a[i][1]+segXY.b[i][1])/2];
+    let d = Math.hypot(m[0]-p[0], m[1]-p[1]);
+    for (let k = 0; k + 1 < path.length && d > thr; k++) d = Math.min(d, distPointSeg(m, path[k], path[k+1]));
     if (d < minD) minD = d;
-    if (!s.c && d <= thr){ s.c = ts; changed = true; }
+    if (s.c || d > thr || i < lo || i > hi || moveDir == null) continue;
+    let dd = Math.abs(segXY.dir[i] - moveDir); if (dd > Math.PI) dd = 2*Math.PI - dd; // 向きの差 (0〜π)
+    if (dd <= tol){ s.c = ts; changed = true; }
   }
-  prevXY = p;
+  if (advanced){ trail.push(p); if (trail.length > COV.trailN) trail.shift(); }
   $('stDist').textContent = minD < 9999 ? Math.round(minD) : '—';
   if (changed){ renderCovered(); dirty = true; }
-  updateNav(lat, lon, p, locate(mainG, p, mainProg), heading, speed, ts);
+  updateNav(lat, lon, p, mainLoc, heading, speed, ts);
 }
 setInterval(() => { if (dirty){ dirty = false; persist(); } }, 3000);
 
@@ -653,7 +725,7 @@ async function startDrive(){
   if (!cur || cur.segs.length === 0){ toast('先にルートを作成してください'); return; }
   if (!navigator.geolocation){ toast('この端末では位置情報が使えません'); return; }
   setMode('drive');
-  prevXY = null; clearNav(); ensureSegXY(); showNav(null);
+  trail = []; moveDir = null; clearNav(); ensureSegXY(); showNav(null);
   speak('ナビを開始します');
   try { const t = await DB.trackOf(cur.id); trackLine.setLatLngs(t.slice(-5000).map(p => [p.lat, p.lon])); } catch(e){}
   watchId = navigator.geolocation.watchPosition(
@@ -681,7 +753,7 @@ document.addEventListener('visibilitychange', () => { if (document.visibilitySta
 function startSim(){
   if (!cur || !cur.segs.length){ toast('先にルートを作成してください'); return; }
   $('simSheet').classList.remove('open'); $('menu').classList.remove('open');
-  setMode('drive'); prevXY = null; setFollow(true); clearNav(); ensureSegXY(); showNav(null);
+  setMode('drive'); trail = []; moveDir = null; setFollow(true); clearNav(); ensureSegXY(); showNav(null);
   speak('ナビを開始します');
   const geom = cur.geometry, cum = [0];
   for (let i = 1; i < geom.length; i++) cum.push(cum[i-1] + haversine(geom[i-1], geom[i]));
@@ -723,7 +795,7 @@ function refreshSelect(){
 }
 async function selectRoute(id, fit){
   cur = routes.find(r => r.id === id) || null;
-  segXY = null; mainG = null; prevXY = null; trackLine.setLatLngs([]); clearNav();
+  segXY = null; mainG = null; trail = []; moveDir = null; trackLine.setLatLngs([]); clearNav();
   localStorage.setItem('rd.cur', id || '');
   refreshSelect(); renderRoute(fit); $('stDist').textContent = '—';
   if (cur && !cur.nav && cur.waypoints.length >= 2) doRecompute(); // 旧バージョンで作ったルートに案内情報を付ける
@@ -999,7 +1071,7 @@ $('exportSheet').onclick = async e => {
     case 'split-geojson': await exportSplit('geojson'); break;
   }
 };
-$('simSkip').onclick = () => { if (sim){ sim.pos += 500; prevXY = null; toast('500m 先へ移動'); } else toast('シミュレーション開始後に押してください'); };
+$('simSkip').onclick = () => { if (sim){ sim.pos += 500; trail = []; moveDir = null; toast('500m 先へ移動'); } else toast('シミュレーション開始後に押してください'); };
 $('simSheet').onclick = e => { if (e.target === $('simSheet')) $('simSheet').classList.remove('open'); };
 window.addEventListener('beforeunload', () => { if (dirty) persist(); });
 
