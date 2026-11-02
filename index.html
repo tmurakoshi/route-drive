@@ -67,6 +67,7 @@
   .me-icon{width:22px;height:22px;border-radius:50%;background:var(--accent);border:3px solid #fff;box-shadow:0 0 0 2px rgba(59,130,246,.4),0 2px 6px rgba(0,0,0,.5)}
   .me-icon.heading::after{content:"";position:absolute;left:50%;top:-14px;margin-left:-7px;border:7px solid transparent;border-bottom:12px solid var(--accent)}
   .ver{font-size:11px;color:var(--muted);text-align:right;margin-top:6px}
+  .net{font-size:12px;line-height:1.6;color:var(--fg);background:#1b2127;border-radius:10px;padding:8px 10px;white-space:pre-line}
   #navBar{top:calc(env(safe-area-inset-top) + 60px);padding:10px 12px;display:none;gap:12px;align-items:center;border-bottom:1px solid var(--line)}
   body.driving #navBar{display:flex}
   #navArrow{font-size:40px;width:52px;text-align:center;line-height:1;transition:transform .3s;color:#fff}
@@ -153,6 +154,8 @@
   <button class="item danger" data-act="reset">走行記録をリセット（未走行に戻す）</button>
   <button class="item danger" data-act="delete">このルートを削除</button>
   <button class="item" data-act="close">閉じる</button>
+  <label>通信（起動からの累計と直近 10 秒。動作が遅いときに回線のせいか切り分ける用）</label>
+  <div id="netInfo" class="net">計測中…</div>
   <div class="ver">build <span id="ver"></span> · 地図 © OpenStreetMap · 経路 OSRM</div>
 </div></div>
 
@@ -186,7 +189,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
 'use strict';
-const VERSION = '2026-11-02.1';
+const VERSION = '2026-11-02.2';
 document.getElementById('ver').textContent = VERSION;
 const STEP_M = 15;            // ルートをこの長さの区間に分割して通過判定する
 // 経路計算サーバー（無料のデモ）。車は一方通行・進入禁止を守る。徒歩は無視して最短で結ぶ
@@ -309,10 +312,67 @@ function newRoute(name){
 }
 async function persist(){ if (cur){ cur.updatedAt = Date.now(); await DB.putRoute(cur); } }
 
+/* ---------- 通信の計測 ---------- */
+// タイル画像と経路計算の各リクエストについて、バイト数・所要時間・成否を記録する。
+// 配信元が計測ヘッダー(Timing-Allow-Origin)を返さないためブラウザ標準の統計は使えず、自前で fetch して測る。
+// 1 リクエストあたりの処理は配列に 1 件足すだけで、GPS 判定やナビには影響しない。
+const net = { t0: Date.now(), bytes: 0, tiles: 0, routes: 0, errs: 0, cached: 0, recent: [] };
+function netLog(kind, bytes, ms, ok){
+  const cached = ok && ms < 15 && kind === 'tile'; // ブラウザキャッシュから出た分は通信量に数えない（所要時間で推定）
+  if (!ok) net.errs++; else if (cached) net.cached++; else net.bytes += bytes;
+  if (kind === 'tile') net.tiles++; else net.routes++;
+  net.recent.push({ t: Date.now(), bytes, ms, ok, cached });
+  if (net.recent.length > 400) net.recent.splice(0, net.recent.length - 400);
+}
+const MeteredTiles = L.TileLayer.extend({
+  createTile(coords, done){
+    const img = document.createElement('img'); img.alt = ''; img.setAttribute('role', 'presentation');
+    const url = this.getTileUrl(coords), t0 = performance.now();
+    fetch(url).then(async res => {
+      const blob = await res.blob();
+      netLog('tile', blob.size, performance.now() - t0, res.ok);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      img.onload = () => { URL.revokeObjectURL(img.src); done(null, img); };
+      img.onerror = e => done(e, img);
+      img.src = URL.createObjectURL(blob);
+    }).catch(e => { if (!(e instanceof Error && /^HTTP/.test(e.message))) netLog('tile', 0, performance.now() - t0, false); done(e, img); });
+    return img;
+  }
+});
+async function fetchJSON(url){
+  const t0 = performance.now();
+  try {
+    const res = await fetch(url); const txt = await res.text();
+    netLog('route', +(res.headers.get('content-length')) || txt.length, performance.now() - t0, res.ok);
+    return JSON.parse(txt);
+  } catch (e){ netLog('route', 0, performance.now() - t0, false); throw e; }
+}
+const fmtBytes = b => b < 1024*1024 ? `${(b/1024).toFixed(0)} KB` : `${(b/1024/1024).toFixed(1)} MB`;
+function renderNet(){
+  const el = $('netInfo'); if (!el) return;
+  const now = Date.now(), win = net.recent.filter(x => now - x.t <= 10000);
+  const netOnly = win.filter(x => x.ok && !x.cached);
+  const sec = Math.floor((now - net.t0) / 1000), hh = Math.floor(sec/3600), mm = Math.floor(sec%3600/60);
+  let recentLine;
+  if (!win.length) recentLine = '直近 10 秒: 通信なし';
+  else {
+    const ms = netOnly.map(x => x.ms).sort((a,b) => a-b), med = ms.length ? ms[Math.floor(ms.length/2)] : null;
+    const bytes = netOnly.reduce((a,x) => a + x.bytes, 0), time = netOnly.reduce((a,x) => a + x.ms, 0) / 1000;
+    const errs = win.filter(x => !x.ok).length, cached = win.filter(x => x.cached).length;
+    let q = '';
+    if (med !== null) q = med < 300 ? '良好' : med < 1000 ? 'やや遅い' : '遅い';
+    if (errs) q = '不安定';
+    recentLine = `直近 10 秒: ${win.length} 件（キャッシュ ${cached}・失敗 ${errs}）` + (med !== null ? `・応答 ${med < 1000 ? Math.round(med) + ' ms' : (med/1000).toFixed(1) + ' 秒'}・実効 ${time > 0 ? fmtBytes(bytes / time) : '—'}/秒` : '') + (q ? `　回線: ${q}` : '');
+  }
+  el.textContent = `起動から ${hh}:${String(mm).padStart(2,'0')}　通信量 ${fmtBytes(net.bytes)}（地図 ${net.tiles} 枚・経路計算 ${net.routes} 回・キャッシュ ${net.cached}・失敗 ${net.errs}）
+${recentLine}`;
+}
+setInterval(renderNet, 10000);
+
 /* ---------- 地図 ---------- */
 function initMap(){
   map = L.map('map', { preferCanvas: true, zoomControl: false, attributionControl: true }).setView([35.681, 139.767], 14);
-  tiles = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '© OpenStreetMap contributors' }).addTo(map);
+  tiles = new MeteredTiles('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '© OpenStreetMap contributors' }).addTo(map);
   routeLine = L.polyline([], { color: '#e5484d', weight: 7, opacity: .9 }).addTo(map);
   coveredLayer = L.layerGroup().addTo(map);
   trackLine = L.polyline([], { color: '#3b82f6', weight: 3, opacity: .5, dashArray: '4 6' }).addTo(map);
@@ -372,8 +432,7 @@ async function doRecompute(){
   try {
     const coords = r.waypoints.map(w => `${w[1].toFixed(5)},${w[0].toFixed(5)}`).join(';'); // 5桁(約1m)に丸めて URL を短く
     // 読み込んだ線は経由地が密なので、経由地での U ターンを許可しないと行き止まりの往復や中央分離帯で大回りになる
-    const res = await fetch(`${osrm(r)}${coords}?overview=false&geometries=geojson&steps=true${r.imported ? '&continue_straight=false' : ''}`);
-    const j = await res.json();
+    const j = await fetchJSON(`${osrm(r)}${coords}?overview=false&geometries=geojson&steps=true${r.imported ? '&continue_straight=false' : ''}`);
     if (seq !== recomputeSeq || cur !== r) return; // 古い結果は捨てる
     if (j.code !== 'Ok') throw new Error(j.message || j.code);
     const pr = parseRoute(j.routes[0]);
@@ -508,8 +567,7 @@ async function reroute(lat, lon, heading, speed, ts){
   const target = j < cur.segs.length ? cur.segs[j].a : cur.geometry[cur.geometry.length-1];
   const bearing = (heading != null && !isNaN(heading) && speed > 2) ? `${Math.round(heading)},45;` : ';';
   try {
-    const res = await fetch(`${osrm(cur)}${lon},${lat};${target[1]},${target[0]}?overview=false&geometries=geojson&steps=true&bearings=${bearing}`);
-    const j2 = await res.json();
+    const j2 = await fetchJSON(`${osrm(cur)}${lon},${lat};${target[1]},${target[0]}?overview=false&geometries=geojson&steps=true&bearings=${bearing}`);
     if (j2.code !== 'Ok') throw new Error(j2.message || j2.code);
     if (mode !== 'drive') return;
     const pr = parseRoute(j2.routes[0], { skipArrive: true });
@@ -892,7 +950,7 @@ $('undoBtn').onclick = () => { if (cur.waypoints.length){ cur.waypoints.pop(); r
 $('clearBtn').onclick = () => { if (confirm('経由地をすべて消しますか？')){ cur.waypoints = []; recomputeRoute(); } };
 $('driveBtn').onclick = () => mode === 'drive' ? stopDrive() : startDrive();
 $('followBtn').onclick = () => setFollow(!settings.follow);
-$('menuBtn').onclick = () => { $('menuTitle').textContent = cur ? cur.name : 'メニュー'; $('menu').classList.add('open'); };
+$('menuBtn').onclick = () => { $('menuTitle').textContent = cur ? cur.name : 'メニュー'; renderNet(); $('menu').classList.add('open'); };
 $('menu').onclick = async e => {
   if (e.target === $('menu')) return $('menu').classList.remove('open');
   const act = e.target.dataset.act; if (!act) return;
