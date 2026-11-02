@@ -186,7 +186,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
 'use strict';
-const VERSION = '2026-10-28.1';
+const VERSION = '2026-11-02.1';
 document.getElementById('ver').textContent = VERSION;
 const STEP_M = 15;            // ルートをこの長さの区間に分割して通過判定する
 // 経路計算サーバー（無料のデモ）。車は一方通行・進入禁止を守る。徒歩は無視して最短で結ぶ
@@ -370,8 +370,9 @@ async function doRecompute(){
   if (r.waypoints.length < 2){ r.geometry = []; r.segs = []; r.distance = 0; renderRoute(false); await persist(); return; }
   $('editHint').textContent = '道路ルートを計算中…';
   try {
-    const coords = r.waypoints.map(w => `${w[1]},${w[0]}`).join(';');
-    const res = await fetch(`${osrm(r)}${coords}?overview=false&geometries=geojson&steps=true`);
+    const coords = r.waypoints.map(w => `${w[1].toFixed(5)},${w[0].toFixed(5)}`).join(';'); // 5桁(約1m)に丸めて URL を短く
+    // 読み込んだ線は経由地が密なので、経由地での U ターンを許可しないと行き止まりの往復や中央分離帯で大回りになる
+    const res = await fetch(`${osrm(r)}${coords}?overview=false&geometries=geojson&steps=true${r.imported ? '&continue_straight=false' : ''}`);
     const j = await res.json();
     if (seq !== recomputeSeq || cur !== r) return; // 古い結果は捨てる
     if (j.code !== 'Ok') throw new Error(j.message || j.code);
@@ -710,7 +711,7 @@ async function importFromURL(){
 }
 
 /* ---------- ファイルからルートを読み込む（GPX / GeoJSON） ---------- */
-const MAX_IMPORT_WP = 60; // 経路サーバーに渡す経由地の上限（多いほど元の線に忠実、少ないほど編集しやすい）
+const MAX_IMPORT_WP = 300; // 経路サーバーに渡す経由地の上限（多いほど元の線に忠実。公開サーバーは 500 点まで受け付けることを確認済み）
 // 戻り値 { name, points:[[lat,lon],...], kind:'rte'|'trk'|'wpt'|'line'|'point', count }
 function parseImportText(text, filename){
   const base = (filename || 'ルート').replace(/\.[^.]+$/, '');
@@ -778,7 +779,7 @@ async function importRouteFromText(text, filename){
   if (parsed.points.length < 2) throw new Error('点が 2 つ以上必要です');
   const wps = thinToWaypoints(parsed.points, MAX_IMPORT_WP);
   if (wps.length < 2) throw new Error('距離が短すぎてルートにできません');
-  const r = newRoute(parsed.name); r.waypoints = wps; routes.push(r); await DB.putRoute(r);
+  const r = newRoute(parsed.name); r.waypoints = wps; r.imported = true; routes.push(r); await DB.putRoute(r);
   await selectRoute(r.id, false);
   const note = parsed.count > 1 ? `（ファイル内の線 ${parsed.count} 本を${parsed.kind === 'line' ? '連結' : 'のうち最初の 1 本を使用'}）` : '';
   toast(`「${parsed.name}」を読み込みました${note}。元の ${parsed.points.length} 点 → 経由地 ${wps.length} 点で道路ルートを計算中…`, 5000);
