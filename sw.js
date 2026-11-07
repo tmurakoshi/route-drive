@@ -1,6 +1,6 @@
 // ネットワーク優先・失敗時キャッシュ。更新を即反映させるため。
-const CACHE = 'route-drive-v1';
-const SHELL = ['./', './index.html', './manifest.json', './icon.svg'];
+const CACHE = 'route-drive-v2';
+const SHELL = ['./', './index.html', './manifest.json', './icon.svg', './vendor/leaflet/leaflet.css', './vendor/leaflet/leaflet.js'];
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
 });

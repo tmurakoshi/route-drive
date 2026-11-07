@@ -11,7 +11,7 @@
 <link rel="manifest" href="manifest.json">
 <link rel="icon" href="icon.svg">
 <link rel="apple-touch-icon" href="icon.svg">
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<link rel="stylesheet" href="vendor/leaflet/leaflet.css">
 <style>
   :root{
     --bg:#101418; --panel:rgba(16,20,24,.92); --fg:#f2f4f6; --muted:#9aa4ad;
@@ -136,12 +136,11 @@
   <h3 id="menuTitle">メニュー</h3>
   <button class="item" data-act="new">＋ 新しいルートを作る</button>
   <button class="item" data-act="rename">名前を変更</button>
-  <button class="item" data-act="share">ルートを共有（リンクを作る）</button>
-  <button class="item" data-act="import">ルートを読み込む（GPX / GeoJSON）</button>
+  <button class="item" data-act="import">ルートを読み込む（ルートファイル / GPX / GeoJSON）</button>
   <input type="file" id="importFile" accept=".gpx,.geojson,.json,application/gpx+xml,application/geo+json,application/json" style="display:none">
   <button class="item" data-act="export">書き出し…</button>
   <button class="item" data-act="sim">シミュレーション走行（机上テスト）</button>
-  <label>音声案内（右左折を読み上げ。ルートを外れたら自動で引き直し）</label>
+  <label>音声案内（右左折を読み上げ）</label>
   <div class="row" style="margin-bottom:8px"><button class="item" id="voiceToggle" style="margin:0"></button><button class="item" id="voiceTest" style="margin:0">読み上げテスト</button></div>
   <label>声の種類（端末に入っている日本語音声。高い声は「女性」「Kyoko」「O-ren」など）</label>
   <select id="voiceSel" style="width:100%"></select>
@@ -149,6 +148,8 @@
   <div class="range"><input type="range" id="pitchRange" min="0.8" max="2" step="0.1"><b id="pitchVal"></b></div>
   <label>話す速さ（既定 1.05）</label>
   <div class="range"><input type="range" id="rateRange" min="0.8" max="1.5" step="0.05"><b id="rateVal"></b></div>
+  <label>ルートを外れたときの引き直し（戻る経路を計算するため現在地を外部の経路サーバーに送ります。送りたくないときはオフ。オフでも「ルートを外れました」とは知らせます）</label>
+  <button class="item" id="rerouteToggle"></button>
   <label>通過判定の距離（m）: GPS がルートからこの距離以内なら「通った」とみなす</label>
   <div class="range"><input type="range" id="thrRange" min="10" max="60" step="5"><b id="thrVal"></b></div>
   <button class="item danger" data-act="reset">走行記録をリセット（未走行に戻す）</button>
@@ -161,6 +162,9 @@
 
 <div id="exportSheet" class="sheet"><div class="card">
   <h3>書き出し</h3>
+  <label>このアプリ用のルートファイル（道路形状と右左折案内を含み、読み込む端末では経路計算も通信も不要）</label>
+  <button class="item" data-exp="route">ルートファイル（配布用。走行状況なし）</button>
+  <button class="item" data-exp="route-cov">ルートファイル＋走行状況（別の端末で続きから走る用）</button>
   <label>計画／走行済／未走行を別ファイルで（3ファイル）</label>
   <button class="item" data-exp="split-gpx">GPX 3ファイル（Google Earth・Garmin 等向け）</button>
   <button class="item" data-exp="split-geojson">GeoJSON 3ファイル（QGIS・My Maps 等向け）</button>
@@ -186,10 +190,10 @@
 
 <div id="toast"></div>
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="vendor/leaflet/leaflet.js"></script>
 <script>
 'use strict';
-const VERSION = '2026-11-02.3';
+const VERSION = '2026-11-08.1';
 document.getElementById('ver').textContent = VERSION;
 const STEP_M = 15;            // ルートをこの長さの区間に分割して通過判定する
 // 経路計算サーバー（無料のデモ）。車は一方通行・進入禁止を守る。徒歩は無視して最短で結ぶ
@@ -200,7 +204,7 @@ const OSRM_BASE = {
 };
 const PROFILE_JA = { car: '車', bike: '自転車', foot: '徒歩' };
 const osrm = r => OSRM_BASE[(r && r.profile) || 'car'];
-const settings = Object.assign({ thr: 25, follow: true, voice: true, voiceName: '', pitch: 1.3, rate: 1.05 },JSON.parse(localStorage.getItem('rd.settings') || '{}'));
+const settings = Object.assign({ thr: 25, follow: true, voice: true, voiceName: '', pitch: 1.3, rate: 1.05, reroute: false },JSON.parse(localStorage.getItem('rd.settings') || '{}'));
 function saveSettings(){ localStorage.setItem('rd.settings', JSON.stringify(settings)); }
 
 /* ---------- IndexedDB ---------- */
@@ -598,7 +602,10 @@ function updateNav(lat, lon, p, mainLoc, heading, speed, ts){
     if (dl.d <= offThr){ detProg = dl.prog; offCount = 0; }
     g = detour; prog = detProg;
   }
-  if (offCount >= 3 && ts - lastReroute > 20000) reroute(lat, lon, heading, speed, ts);
+  if (offCount >= 3 && ts - lastReroute > 20000){
+    if (settings.reroute) reroute(lat, lon, heading, speed, ts);
+    else { lastReroute = ts; speak('ルートを外れました。ルートに戻ってください'); toast('ルートを外れています（引き直しはオフ）', 4000); }
+  }
   if (!g || prog == null){ showNav(null); return; }
   if (navG !== g) switchGuide(g);
   while (navIdx < g.nav.length && g.nav[navIdx].at - prog < -25){ navIdx++; announced = {}; }
@@ -808,38 +815,6 @@ async function createRoute(){
   else navigator.geolocation && navigator.geolocation.getCurrentPosition(p => map.setView([p.coords.latitude, p.coords.longitude], 15), ()=>{}, { timeout: 5000 });
 }
 
-/* ---------- ルート共有リンク ---------- */
-// ?route=名前|lat,lon;lat,lon;... の形。開いた端末に同じ経由地のルートを作る
-function shareURL(r){
-  const w = r.waypoints.map(p => `${p[0].toFixed(5)},${p[1].toFixed(5)}`).join(';');
-  return `${location.origin}${location.pathname}?route=${encodeURIComponent(r.name + '|' + w)}`;
-}
-async function shareRoute(){
-  if (!cur || cur.waypoints.length < 2){ toast('経由地が2つ以上あるルートを選んでください'); return; }
-  const url = shareURL(cur);
-  if (navigator.share){ try { await navigator.share({ title: `ルート: ${cur.name}`, text: `ルート走行チェック「${cur.name}」`, url }); return; } catch(e){ if (e.name === 'AbortError') return; } }
-  try { await navigator.clipboard.writeText(url); toast('リンクをコピーしました。メッセージなどに貼って送ってください', 4000); }
-  catch(e){ prompt('このリンクをコピーしてください', url); }
-}
-async function importFromURL(){
-  const q = new URLSearchParams(location.search).get('route');
-  if (!q) return false;
-  history.replaceState(null, '', location.pathname); // 再読み込みで二重に取り込まないよう消す
-  const bar = q.indexOf('|');
-  const name = (bar > 0 ? q.slice(0, bar) : '共有ルート').trim() || '共有ルート';
-  const wps = q.slice(bar + 1).split(';').map(s => s.split(',').map(Number)).filter(p => p.length === 2 && p.every(n => isFinite(n)) && Math.abs(p[0]) <= 90 && Math.abs(p[1]) <= 180);
-  if (wps.length < 2){ toast('共有リンクのルートを読めませんでした'); return false; }
-  const key = r => r.waypoints.map(p => `${p[0].toFixed(5)},${p[1].toFixed(5)}`).join(';');
-  const same = routes.find(r => key(r) === key({ waypoints: wps }));
-  if (same){ await selectRoute(same.id, true); toast(`同じルート「${same.name}」が既にあります`, 3000); return true; }
-  const r = newRoute(name); r.waypoints = wps; routes.push(r); await DB.putRoute(r);
-  await selectRoute(r.id, false);
-  toast(`共有ルート「${name}」を取り込みました。道路ルートを計算中…`, 4000);
-  await doRecompute();
-  if (cur === r && r.geometry.length > 1) map.fitBounds(L.latLngBounds(r.geometry), { padding: [40, 40] });
-  return true;
-}
-
 /* ---------- ファイルからルートを読み込む（GPX / GeoJSON） ---------- */
 const MAX_IMPORT_WP = 300; // 経路サーバーに渡す経由地の上限（多いほど元の線に忠実。公開サーバーは 500 点まで受け付けることを確認済み）
 // 戻り値 { name, points:[[lat,lon],...], kind:'rte'|'trk'|'wpt'|'line'|'point', count }
@@ -919,7 +894,12 @@ async function importRouteFromText(text, filename){
 }
 $('importFile').onchange = async e => {
   const f = e.target.files && e.target.files[0]; if (!f) return;
-  try { await importRouteFromText(await f.text(), f.name); }
+  try {
+    const text = await f.text();
+    let j = null; if (/^\s*\{/.test(text)){ try { j = JSON.parse(text); } catch(e){} }
+    if (j && j.format === ROUTE_FILE_FORMAT) await importRouteFile(j);
+    else await importRouteFromText(text, f.name);
+  }
   catch (err){ toast('読み込めませんでした: ' + err.message, 5000); }
 };
 
@@ -953,6 +933,41 @@ function exportCSV(){
 function exportGeoJSON(){
   const feats = cur.segs.map((s, i) => ({ type: 'Feature', properties: { index: i, covered: !!s.c, covered_at: s.c ? new Date(s.c).toISOString() : null, length_m: +s.len.toFixed(1) }, geometry: { type: 'LineString', coordinates: [[s.a[1], s.a[0]], [s.b[1], s.b[0]]] } }));
   shareFile(fname('geojson'), JSON.stringify({ type: 'FeatureCollection', name: cur.name, features: feats }), 'application/geo+json');
+}
+
+/* このアプリ用のルートファイル。形状・案内・区間の通過状況まで入るので、読み込む側は経路サーバーを呼ばない */
+const ROUTE_FILE_FORMAT = 'route-drive/route';
+function routeFileText(r, withCoverage){
+  const covered = withCoverage ? r.segs.map((s, i) => s.c ? [i, s.c] : null).filter(Boolean) : [];
+  const o = { format: ROUTE_FILE_FORMAT, version: 1, exportedAt: new Date().toISOString(), app: VERSION,
+    name: r.name, profile: r.profile || 'car', waypoints: r.waypoints, geometry: r.geometry, nav: r.nav || [], legEnds: r.legEnds || [],
+    distance: r.distance, segCount: r.segs.length, covered };
+  return JSON.stringify(o);
+}
+async function exportRouteFile(withCoverage){
+  if (!cur || cur.geometry.length < 2){ toast('道路ルートがまだありません'); return; }
+  const n = cur.segs.filter(s => s.c).length;
+  toast(withCoverage ? `走行状況つき（${cur.segs.length} 区間中 ${n} 区間が走行済）で書き出します` : '走行状況なしで書き出します', 3000);
+  await shareFile(`${cur.name.replace(/[\\/:*?"<>|]/g,'_')}${withCoverage ? '_走行状況つき' : ''}.route.json`, routeFileText(cur, withCoverage), 'application/json');
+}
+// 読み込み。別の端末で書き出したファイルをそのまま復元する（通信なし）
+async function importRouteFile(j){
+  const ok = p => Array.isArray(p) && p.length === 2 && p.every(n => isFinite(n)) && Math.abs(p[0]) <= 90 && Math.abs(p[1]) <= 180;
+  if (!Array.isArray(j.geometry) || j.geometry.length < 2 || !j.geometry.every(ok)) throw new Error('ルートファイルの形状が壊れています');
+  const r = newRoute(String(j.name || 'ルート').slice(0, 100));
+  r.profile = ['car','bike','foot'].includes(j.profile) ? j.profile : 'car';
+  r.waypoints = Array.isArray(j.waypoints) ? j.waypoints.filter(ok) : [];
+  r.geometry = j.geometry; r.nav = Array.isArray(j.nav) ? j.nav : []; r.legEnds = Array.isArray(j.legEnds) ? j.legEnds : [];
+  r.distance = +j.distance || 0; r.imported = true;
+  r.segs = buildSegments(r.geometry);
+  let n = 0;
+  if (Array.isArray(j.covered) && j.segCount === r.segs.length){
+    for (const c of j.covered){ const i = c && c[0]; if (Number.isInteger(i) && r.segs[i]){ r.segs[i].c = +c[1] || 1; n++; } }
+  } else if (Array.isArray(j.covered) && j.covered.length) toast('走行状況は区間数が合わないため復元しませんでした', 4000);
+  routes.push(r); await DB.putRoute(r);
+  await selectRoute(r.id, true); setMode('view');
+  toast(`ルート「${r.name}」を読み込みました（${(r.distance/1000).toFixed(1)} km${n ? `・走行済 ${n} 区間を復元` : ''}）`, 4000);
+  return r;
 }
 
 /* 計画・走行済・未走行を別ファイルで書き出し */
@@ -1026,13 +1041,12 @@ $('menuBtn').onclick = () => { $('menuTitle').textContent = cur ? cur.name : '�
 $('menu').onclick = async e => {
   if (e.target === $('menu')) return $('menu').classList.remove('open');
   const act = e.target.dataset.act; if (!act) return;
-  const needCur = ['rename','share','export','sim','reset','delete'];
+  const needCur = ['rename','export','sim','reset','delete'];
   if (needCur.includes(act) && !cur){ toast('ルートがありません'); return; }
   if (['rename','reset','delete','sim'].includes(act) && mode === 'drive'){ toast('走行中は操作できません。先に走行停止してください'); return; }
   switch (act){
     case 'new': $('menu').classList.remove('open'); await createRoute(); return;
     case 'rename': { const n = prompt('ルート名', cur.name); if (n && n.trim()){ cur.name = n.trim(); await persist(); refreshSelect(); } break; }
-    case 'share': await shareRoute(); break;
     case 'import': $('menu').classList.remove('open'); $('importFile').value = ''; $('importFile').click(); return;
     case 'export': $('menu').classList.remove('open'); $('exportSheet').classList.add('open'); return;
     case 'sim': $('simSheet').classList.add('open'); return;
@@ -1047,6 +1061,9 @@ $('simStart').onclick = startSim;
 $('simOff').onclick = () => { if (sim){ sim.offUntil = performance.now() + 20000; $('simSheet').classList.remove('open'); toast('20秒間ルートを外れます'); } else toast('シミュレーション開始後に押してください'); };
 const voiceLabel = () => $('voiceToggle').textContent = settings.voice ? '音声案内: オン' : '音声案内: オフ';
 voiceLabel();
+const rerouteLabel = () => $('rerouteToggle').textContent = settings.reroute ? '引き直し: オン（現在地を送信）' : '引き直し: オフ（送信しない）';
+rerouteLabel();
+$('rerouteToggle').onclick = () => { settings.reroute = !settings.reroute; saveSettings(); rerouteLabel(); };
 $('voiceToggle').onclick = () => { settings.voice = !settings.voice; saveSettings(); voiceLabel(); };
 $('voiceTest').onclick = () => speak('300メートル先、右折、明治通りへ');
 $('voiceSel').onchange = e => { settings.voiceName = e.target.value; saveSettings(); speak('この声で案内します'); };
@@ -1069,6 +1086,8 @@ $('exportSheet').onclick = async e => {
     case 'geojson': exportGeoJSON(); break;
     case 'split-gpx': await exportSplit('gpx'); break;
     case 'split-geojson': await exportSplit('geojson'); break;
+    case 'route': await exportRouteFile(false); break;
+    case 'route-cov': await exportRouteFile(true); break;
   }
 };
 $('simSkip').onclick = () => { if (sim){ sim.pos += 500; trail = []; moveDir = null; toast('500m 先へ移動'); } else toast('シミュレーション開始後に押してください'); };
@@ -1082,8 +1101,7 @@ window.addEventListener('beforeunload', () => { if (dirty) persist(); });
   routes.sort((a,b) => a.createdAt - b.createdAt);
   const want = localStorage.getItem('rd.cur');
   await selectRoute(routes.find(r => r.id === want) ? want : (routes[0] ? routes[0].id : null), true);
-  const imported = await importFromURL().catch(e => { toast('共有リンクの取り込みに失敗: ' + e.message); return false; });
-  if (!routes.length && !imported){
+  if (!routes.length){
     toast('右上 ☰ → 新しいルートを作る、または「ルート編集」から始めてください', 5000);
     navigator.geolocation && navigator.geolocation.getCurrentPosition(p => map.setView([p.coords.latitude, p.coords.longitude], 15), ()=>{}, { timeout: 5000 });
   }
