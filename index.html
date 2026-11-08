@@ -148,7 +148,7 @@
   <div class="range"><input type="range" id="pitchRange" min="0.8" max="2" step="0.1"><b id="pitchVal"></b></div>
   <label>話す速さ（既定 1.05）</label>
   <div class="range"><input type="range" id="rateRange" min="0.8" max="1.5" step="0.05"><b id="rateVal"></b></div>
-  <label>ルートを外れたときの引き直し（戻る経路を計算するため現在地を外部の経路サーバーに送ります。送りたくないときはオフ。オフでも「ルートを外れました」とは知らせます）</label>
+  <label>ルートを外れたときの引き直し（既定はオン。戻る経路を計算するため現在地を経路サーバーに送ります。オフにしても「ルートを外れました」とは知らせます）</label>
   <button class="item" id="rerouteToggle"></button>
   <label>通過判定の距離（m）: GPS がルートからこの距離以内なら「通った」とみなす</label>
   <div class="range"><input type="range" id="thrRange" min="10" max="60" step="5"><b id="thrVal"></b></div>
@@ -164,7 +164,7 @@
   <h3>書き出し</h3>
   <label>このアプリ用のルートファイル（道路形状と右左折案内を含み、読み込む端末では経路計算も通信も不要）</label>
   <button class="item" data-exp="route">ルートファイル（配布用。走行状況なし）</button>
-  <button class="item" data-exp="route-cov">ルートファイル＋走行状況（別の端末で続きから走る用）</button>
+  <button class="item" data-exp="route-cov">ルートファイル＋走行状況（区間の通過状況とGPS軌跡。別の端末で続きから走る用）</button>
   <label>計画／走行済／未走行を別ファイルで（3ファイル）</label>
   <button class="item" data-exp="split-gpx">GPX 3ファイル（Google Earth・Garmin 等向け）</button>
   <button class="item" data-exp="split-geojson">GeoJSON 3ファイル（QGIS・My Maps 等向け）</button>
@@ -193,7 +193,7 @@
 <script src="vendor/leaflet/leaflet.js"></script>
 <script>
 'use strict';
-const VERSION = '2026-11-08.1';
+const VERSION = '2026-11-08.2';
 document.getElementById('ver').textContent = VERSION;
 const STEP_M = 15;            // ルートをこの長さの区間に分割して通過判定する
 // 経路計算サーバー（無料のデモ）。車は一方通行・進入禁止を守る。徒歩は無視して最短で結ぶ
@@ -204,7 +204,8 @@ const OSRM_BASE = {
 };
 const PROFILE_JA = { car: '車', bike: '自転車', foot: '徒歩' };
 const osrm = r => OSRM_BASE[(r && r.profile) || 'car'];
-const settings = Object.assign({ thr: 25, follow: true, voice: true, voiceName: '', pitch: 1.3, rate: 1.05, reroute: false },JSON.parse(localStorage.getItem('rd.settings') || '{}'));
+const settings = Object.assign({ thr: 25, follow: true, voice: true, voiceName: '', pitch: 1.3, rate: 1.05, reroute: true, rerouteSet: false },JSON.parse(localStorage.getItem('rd.settings') || '{}'));
+if (!settings.rerouteSet) settings.reroute = true; // 利用者が自分で切り替えるまでは常にオン
 function saveSettings(){ localStorage.setItem('rd.settings', JSON.stringify(settings)); }
 
 /* ---------- IndexedDB ---------- */
@@ -234,6 +235,7 @@ const DB = {
   putRoute(r){ return DB.tx('routes', 'readwrite', s => s.put(r)); },
   delRoute(id){ return DB.tx('routes', 'readwrite', s => s.delete(id)); },
   addTrack(p){ return DB.tx('track', 'readwrite', s => s.add(p)); },
+  addTracks(ps){ return DB.tx('track', 'readwrite', s => { ps.forEach(p => s.add(p)); return null; }); },
   trackOf(routeId){ return DB.tx('track', 'readonly', s => s.index('routeId').getAll(routeId)); },
   clearTrack(routeId){
     return DB.tx('track', 'readwrite', s => {
@@ -937,18 +939,22 @@ function exportGeoJSON(){
 
 /* このアプリ用のルートファイル。形状・案内・区間の通過状況まで入るので、読み込む側は経路サーバーを呼ばない */
 const ROUTE_FILE_FORMAT = 'route-drive/route';
-function routeFileText(r, withCoverage){
+async function routeFileText(r, withCoverage){
   const covered = withCoverage ? r.segs.map((s, i) => s.c ? [i, s.c] : null).filter(Boolean) : [];
+  // GPS の生の軌跡（走行状況つきのみ）。[時刻ms, 緯度, 経度, 精度m, 速度m/s]
+  const track = withCoverage ? (await DB.trackOf(r.id)).map(p => [p.t, +p.lat.toFixed(6), +p.lon.toFixed(6), Math.round(p.acc || 0), +(p.spd || 0).toFixed(1)]) : [];
   const o = { format: ROUTE_FILE_FORMAT, version: 1, exportedAt: new Date().toISOString(), app: VERSION,
     name: r.name, profile: r.profile || 'car', waypoints: r.waypoints, geometry: r.geometry, nav: r.nav || [], legEnds: r.legEnds || [],
-    distance: r.distance, segCount: r.segs.length, covered };
+    distance: r.distance, segCount: r.segs.length, covered, track };
   return JSON.stringify(o);
 }
 async function exportRouteFile(withCoverage){
   if (!cur || cur.geometry.length < 2){ toast('道路ルートがまだありません'); return; }
   const n = cur.segs.filter(s => s.c).length;
-  toast(withCoverage ? `走行状況つき（${cur.segs.length} 区間中 ${n} 区間が走行済）で書き出します` : '走行状況なしで書き出します', 3000);
-  await shareFile(`${cur.name.replace(/[\\/:*?"<>|]/g,'_')}${withCoverage ? '_走行状況つき' : ''}.route.json`, routeFileText(cur, withCoverage), 'application/json');
+  const text = await routeFileText(cur, withCoverage);
+  const tn = withCoverage ? JSON.parse(text).track.length : 0;
+  toast(withCoverage ? `走行状況つき（${cur.segs.length} 区間中 ${n} 区間が走行済・GPS軌跡 ${tn} 点）で書き出します` : '走行状況なしで書き出します', 3000);
+  await shareFile(`${cur.name.replace(/[\\/:*?"<>|]/g,'_')}${withCoverage ? '_走行状況つき' : ''}.route.json`, text, 'application/json');
 }
 // 読み込み。別の端末で書き出したファイルをそのまま復元する（通信なし）
 async function importRouteFile(j){
@@ -965,8 +971,13 @@ async function importRouteFile(j){
     for (const c of j.covered){ const i = c && c[0]; if (Number.isInteger(i) && r.segs[i]){ r.segs[i].c = +c[1] || 1; n++; } }
   } else if (Array.isArray(j.covered) && j.covered.length) toast('走行状況は区間数が合わないため復元しませんでした', 4000);
   routes.push(r); await DB.putRoute(r);
+  let tn = 0;
+  if (Array.isArray(j.track) && j.track.length){
+    const pts = j.track.filter(t => Array.isArray(t) && t.length >= 3 && isFinite(t[1]) && isFinite(t[2])).map(t => ({ routeId: r.id, t: +t[0] || 0, lat: +t[1], lon: +t[2], acc: +t[3] || 0, spd: +t[4] || 0 }));
+    try { await DB.addTracks(pts); tn = pts.length; } catch(e){ toast('GPS軌跡の復元に失敗: ' + e.message, 4000); }
+  }
   await selectRoute(r.id, true); setMode('view');
-  toast(`ルート「${r.name}」を読み込みました（${(r.distance/1000).toFixed(1)} km${n ? `・走行済 ${n} 区間を復元` : ''}）`, 4000);
+  toast(`ルート「${r.name}」を読み込みました（${(r.distance/1000).toFixed(1)} km${n ? `・走行済 ${n} 区間` : ''}${tn ? `・GPS軌跡 ${tn} 点` : ''}${n || tn ? 'を復元' : ''}）`, 4000);
   return r;
 }
 
@@ -1063,7 +1074,7 @@ const voiceLabel = () => $('voiceToggle').textContent = settings.voice ? '音声
 voiceLabel();
 const rerouteLabel = () => $('rerouteToggle').textContent = settings.reroute ? '引き直し: オン（現在地を送信）' : '引き直し: オフ（送信しない）';
 rerouteLabel();
-$('rerouteToggle').onclick = () => { settings.reroute = !settings.reroute; saveSettings(); rerouteLabel(); };
+$('rerouteToggle').onclick = () => { settings.reroute = !settings.reroute; settings.rerouteSet = true; saveSettings(); rerouteLabel(); };
 $('voiceToggle').onclick = () => { settings.voice = !settings.voice; saveSettings(); voiceLabel(); };
 $('voiceTest').onclick = () => speak('300メートル先、右折、明治通りへ');
 $('voiceSel').onchange = e => { settings.voiceName = e.target.value; saveSettings(); speak('この声で案内します'); };
