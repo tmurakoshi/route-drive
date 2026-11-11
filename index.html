@@ -59,7 +59,7 @@
   .sheet input[type=text],.sheet input[type=number]{width:100%}
   .sheet .range{display:flex;align-items:center;gap:10px}
   .sheet .range input[type=range]{flex:1}
-  .legend{display:flex;gap:14px;font-size:12px;color:var(--muted);margin-top:6px}
+  .legend{display:flex;gap:12px;font-size:12px;color:var(--muted);margin-top:6px}
   .legend i{display:inline-block;width:18px;height:4px;border-radius:2px;vertical-align:middle;margin-right:4px}
   #toast{position:fixed;left:50%;transform:translateX(-50%);top:calc(env(safe-area-inset-top) + 110px);z-index:3000;background:#222a33;color:#fff;padding:10px 14px;border-radius:10px;font-size:14px;max-width:90vw;display:none;box-shadow:0 4px 16px rgba(0,0,0,.4)}
   .wp-icon{background:var(--accent);color:#fff;border:2px solid #fff;border-radius:50%;width:26px;height:26px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;box-shadow:0 1px 4px rgba(0,0,0,.5)}
@@ -112,7 +112,7 @@
       <button id="editBtn">✎ ルート編集</button>
       <button id="driveBtn" class="primary">▶ 走行開始</button>
     </div>
-    <div class="legend"><span><i style="background:var(--ng)"></i>未走行</span><span><i style="background:var(--ok)"></i>走行済</span><span><i style="background:var(--accent)"></i>現在地</span></div>
+    <div class="legend"><span><i style="background:var(--ng);height:8px;border-radius:4px"></i>次に走る</span><span><i style="background:var(--ng)"></i>未走行</span><span><i style="background:var(--ok)"></i>走行済</span><span><i style="background:var(--accent)"></i>現在地</span></div>
   </div>
   <div id="editPanel" style="display:none">
     <p class="hint" id="editHint">地図をタップして経由地を順に追加。ピンはドラッグで移動、タップで削除。道路に沿ったルートを自動生成します。</p>
@@ -193,7 +193,7 @@
 <script src="vendor/leaflet/leaflet.js"></script>
 <script>
 'use strict';
-const VERSION = '2026-11-08.2';
+const VERSION = '2026-11-11.2';
 document.getElementById('ver').textContent = VERSION;
 const STEP_M = 15;            // ルートをこの長さの区間に分割して通過判定する
 // 経路計算サーバー（無料のデモ）。車は一方通行・進入禁止を守る。徒歩は無視して最短で結ぶ
@@ -340,7 +340,7 @@ function buildSegments(geom){
 /* ---------- 状態 ---------- */
 let routes = [], cur = null, mode = 'view';
 let map, tiles, routeLine, coveredLayer, wpLayer, meMarker, accCircle, trackLine;
-let watchId = null, lastFix = null, wakeLock = null, sim = null, detourLine;
+let watchId = null, lastFix = null, wakeLock = null, sim = null, detourLine, nextLine, arrowsW, arrowsD;
 let segXY = null; // 現ルートの区間の平面座標キャッシュ
 let mainG = null, detour = null, mainProg = null, detProg = null, offCount = 0, lastReroute = 0, navG = null, navIdx = 0, announced = {};
 const $ = id => document.getElementById(id);
@@ -417,11 +417,15 @@ function initMap(){
   coveredLayer = L.layerGroup().addTo(map);
   trackLine = L.polyline([], { color: '#3b82f6', weight: 3, opacity: .5, dashArray: '4 6' }).addTo(map);
   detourLine = L.polyline([], { color: '#f5a524', weight: 6, opacity: .95, dashArray: '10 8' }).addTo(map);
+  nextLine = L.polyline([], { color: '#e5484d', weight: 13, opacity: 1, interactive: false }).addTo(map); // 次に走る区間: 同じ赤の太線
+  arrowsW = L.polygon([], { color: '#7a1418', weight: 1, fillColor: '#fff', fillOpacity: 1, interactive: false }).addTo(map);
+  arrowsD = L.polygon([], { color: '#7a1418', weight: 1, fillColor: '#fff', fillOpacity: 1, interactive: false }).addTo(map); // 次に走る区間の上の矢印（大きめ）
   wpLayer = L.layerGroup().addTo(map);
   accCircle = L.circle([0,0], { radius: 0, color: '#3b82f6', weight: 1, fillOpacity: .1, interactive: false });
   meMarker = L.marker([0,0], { icon: L.divIcon({ className: '', html: '<div class="me-icon"></div>', iconSize: [22,22], iconAnchor: [11,11] }), interactive: false, zIndexOffset: 1000 });
   map.on('click', e => { if (mode === 'edit') addWaypoint([e.latlng.lat, e.latlng.lng]); });
   map.on('dragstart', () => setFollow(false));
+  map.on('moveend zoomend', scheduleArrows);
 }
 function setFollow(on){ settings.follow = on; saveSettings(); $('followBtn').classList.toggle('on', on); if (on && lastFix) map.panTo(lastFix.ll); }
 
@@ -440,7 +444,7 @@ function renderRoute(fit){
 }
 function renderCovered(){
   coveredLayer.clearLayers();
-  if (!cur) { updateStats(); return; }
+  if (!cur) { updateStats(); updateNext(true); return; }
   let run = [];
   const flush = () => { if (run.length > 1) L.polyline(offsetLine(run, COV.offsetM), { color: '#30a46c', weight: 7, opacity: 1 }).addTo(coveredLayer); run = []; };
   for (const s of cur.segs){
@@ -448,6 +452,71 @@ function renderCovered(){
   }
   flush();
   updateStats();
+  updateNext(true);
+}
+/* ---------- 次に走る区間の強調・進行方向の矢印（表示専用。判定・案内には使わない） ---------- */
+const NEXT_M = 500;        // 次に走る区間として強調する長さ (m)
+const ARROW_PX = 60;       // 矢印の間隔 (画面上の px)。ズームしても密度が変わらない
+const ARROW_MAX = 300;     // 一度に描く矢印の上限
+const ARROW_MIN_ZOOM = 13; // これより引いた表示では矢印を出さない
+let segCum = null, segCumFor = null, nextLo = -1, nextHi = -1, arrowRaf = 0;
+function segCumOf(){ // 区間ごとのルート先頭からの距離 (m)
+  if (segCumFor !== cur.segs){ segCum = []; let acc = 0; for (const s of cur.segs){ segCum.push(acc); acc += s.len; } segCumFor = cur.segs; }
+  return segCum;
+}
+// 次に走る区間: 走行中は現在位置以降、それ以外はルート先頭から、最初の未走行区間を起点に NEXT_M 分
+function updateNext(force){
+  let lo = -1, hi = -1; const lines = [];
+  if (cur && cur.segs.length && mode !== 'edit'){
+    const segs = cur.segs, cum = segCumOf();
+    let j = (mode === 'drive' && mainProg != null && segXY) ? segIndexAtProg(mainProg) : 0;
+    while (j < segs.length && segs[j].c) j++;
+    if (j >= segs.length){ j = 0; while (j < segs.length && segs[j].c) j++; } // この先が全部走行済みなら、手前に残った未走行区間
+    if (j < segs.length){
+      lo = j; let run = [];
+      const flush = () => { if (run.length > 1) lines.push(offsetLine(run, COV.offsetM)); run = []; };
+      for (let i = j; i < segs.length && cum[i] - cum[j] < NEXT_M; i++){
+        hi = i;
+        if (segs[i].c) flush(); else { if (!run.length) run.push(segs[i].a); run.push(segs[i].b); }
+      }
+      flush();
+    }
+  }
+  if (!force && lo === nextLo && hi === nextHi) return;
+  nextLo = lo; nextHi = hi;
+  nextLine.setLatLngs(lines);
+  routeLine.setStyle(lines.length ? { weight: 5, opacity: .7 } : { weight: 7, opacity: .9 });
+  nextLine.bringToFront();
+  scheduleArrows();
+}
+function scheduleArrows(){ if (!arrowRaf) arrowRaf = setTimeout(() => { arrowRaf = 0; renderArrows(); }, 60); } // 連続する地図移動・位置更新をまとめて 1 回で描く
+// 未走行の線の上に進行方向の三角を並べる。位置はルート先頭からの距離で決めるので、走行や地図移動で流れない
+function renderArrows(){
+  const white = [], dark = [], z = map.getZoom();
+  if (cur && cur.segs.length && z >= ARROW_MIN_ZOOM){
+    const segs = cur.segs, cum = segCumOf(), bd = map.getBounds().pad(0.05);
+    const S = bd.getSouth(), N = bd.getNorth(), W = bd.getWest(), E = bd.getEast();
+    const mpp = 156543.03392 * Math.cos(map.getCenter().lat * Math.PI / 180) / Math.pow(2, z); // 1px あたりの m
+    const step = ARROW_PX * mpp, off = COV.offsetM / mpp;
+    const pt = (x, y) => map.unproject([x, y], z);
+    for (let i = 0, count = 0; i < segs.length && count < ARROW_MAX; i++){
+      const sg = segs[i];
+      if (sg.c) continue;
+      const k = Math.ceil(cum[i] / step) * step; // この区間に矢印の位置が入るか
+      if (k >= cum[i] + sg.len) continue;
+      const t = (k - cum[i]) / sg.len, lat = sg.a[0] + (sg.b[0]-sg.a[0])*t, lon = sg.a[1] + (sg.b[1]-sg.a[1])*t;
+      if (lat < S || lat > N || lon < W || lon > E) continue;
+      const A = map.project(sg.a, z), B = map.project(sg.b, z);
+      let dx = B.x-A.x, dy = B.y-A.y; const l = Math.hypot(dx, dy); if (l < 1e-6) continue; dx /= l; dy /= l;
+      const nx = dy, ny = -dx; // 画面上で進行方向の左（線の表示オフセットと同じ側）
+      const cx = A.x + (B.x-A.x)*t + nx*off, cy = A.y + (B.y-A.y)*t + ny*off;
+      const nx_ = i >= nextLo && i <= nextHi, m = nx_ ? 1.4 : 1; // 次に走る区間の矢印は大きく
+      const tri = [[pt(cx + dx*6*m, cy + dy*6*m), pt(cx - dx*4*m + nx*5*m, cy - dy*4*m + ny*5*m), pt(cx - dx*4*m - nx*5*m, cy - dy*4*m - ny*5*m)]];
+      (nx_ ? dark : white).push(tri); count++;
+    }
+  }
+  arrowsW.setLatLngs(white); arrowsD.setLatLngs(dark);
+  arrowsW.bringToFront(); arrowsD.bringToFront();
 }
 function updateStats(){
   let tot = 0, done = 0;
@@ -726,6 +795,7 @@ function onFix(lat, lon, acc, heading, speed, ts, isSim){
   $('stDist').textContent = minD < 9999 ? Math.round(minD) : '—';
   if (changed){ renderCovered(); dirty = true; }
   updateNav(lat, lon, p, mainLoc, heading, speed, ts);
+  updateNext(false);
 }
 setInterval(() => { if (dirty){ dirty = false; persist(); } }, 3000);
 
