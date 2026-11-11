@@ -75,6 +75,10 @@
   #navText{font-size:16px;line-height:1.3}
   #navThen{font-size:12px;color:var(--muted)}
   body.driving #gpsPill{top:calc(env(safe-area-inset-top) + 150px)}
+  #wakePill{top:calc(env(safe-area-inset-top) + 192px);display:none;border-color:var(--warn);color:var(--warn);font-weight:600}
+  body.driving #wakePill.show{display:block}
+  #relocBtn{position:fixed;z-index:1000;right:12px;bottom:228px;display:none;border-radius:999px;background:var(--panel);font-size:13px;min-height:40px;padding:8px 12px}
+  body.driving #relocBtn{display:block}
   .leaflet-control-attribution{font-size:9px}
   .leaflet-popup-content-wrapper{border-radius:10px}
   .leaflet-popup-content button{min-height:36px;padding:6px 10px;font-size:14px}
@@ -98,6 +102,8 @@
 </div>
 
 <div id="gpsPill" class="pill"><span class="dot"></span><span id="gpsText">GPS 待機</span></div>
+<div id="wakePill" class="pill">⚠ 画面が自動で消えます（端末の自動ロックをオフに）</div>
+<button id="relocBtn" aria-label="現在地から案内し直す">↻ 案内し直す</button>
 <button id="followBtn" class="on" aria-label="現在地に追従">◎</button>
 
 <div id="bottom" class="bar">
@@ -193,7 +199,7 @@
 <script src="vendor/leaflet/leaflet.js"></script>
 <script>
 'use strict';
-const VERSION = '2026-11-11.3';
+const VERSION = '2026-11-11.4';
 document.getElementById('ver').textContent = VERSION;
 const STEP_M = 15;            // ルートをこの長さの区間に分割して通過判定する
 // 経路計算サーバー（無料のデモ）。車は一方通行・進入禁止を守る。徒歩は無視して最短で結ぶ
@@ -708,6 +714,41 @@ function locate(g, p, prevProg, preferUncovered, dir){
   }
   return { d: ds[best], prog: progOn(g, best, p) };
 }
+// 今いる通過は、この先 COV.ahead m がすべて走行済みか（走り直しのあと・戻り道）。通常の走行では先が未走行なので false
+function passDone(prog){
+  const segs = cur.segs, c = segXY.cum;
+  for (let i = segIndexAtProg(prog); i < segs.length && c[i] <= prog + COV.ahead; i++) if (!segs[i].c) return false;
+  return true;
+}
+// prog 以降で最初の未走行区間の番号。この先に無ければ手前に残った未走行区間。全部走行済みなら -1
+function nextUncovered(prog){
+  const segs = cur.segs; let j = prog == null ? 0 : segIndexAtProg(prog);
+  while (j < segs.length && segs[j].c) j++;
+  if (j >= segs.length){ j = 0; while (j < segs.length && segs[j].c) j++; }
+  return j < segs.length ? j : -1;
+}
+// 現在地のすぐそばを同じ向きに通る未走行区間（一番手前）。同じ道を 2 回通るルートで、走行済みの通過に張り付くのを外すために使う
+function uncoveredHere(p, dir, thr){
+  if (dir == null) return null;
+  const tol = COV.dirTolDeg * Math.PI / 180;
+  for (let i = 0; i < cur.segs.length; i++){
+    if (cur.segs[i].c) continue;
+    let dd = Math.abs(segXY.dir[i] - dir); if (dd > Math.PI) dd = 2*Math.PI - dd;
+    if (dd > tol) continue;
+    const a = segXY.a[i], b = segXY.b[i], d = distPointSeg(p, a, b);
+    if (d > thr) continue;
+    const vx = b[0]-a[0], vy = b[1]-a[1], l2 = vx*vx + vy*vy;
+    const t = l2 ? Math.max(0, Math.min(1, ((p[0]-a[0])*vx + (p[1]-a[1])*vy) / l2)) : 0;
+    return { d, prog: segXY.cum[i] + t * Math.sqrt(l2) };
+  }
+  return null;
+}
+// ルート上の位置を決め直す（走行停止→走行開始と同じ効果）。manual: ボタンから。必要ならすぐ未走行区間への案内を出す
+function relocateNow(manual){
+  detour = null; detProg = null; if (detourLine) detourLine.setLatLngs([]);
+  mainProg = null; lastLoc = null; navG = null; navIdx = 0; announced = {}; altCount = 0;
+  if (manual){ offCount = 3; lastReroute = 0; toast('現在地から案内し直します'); }
+}
 function segIndexAtProg(prog){
   const c = segXY.cum; let i = 0;
   while (i + 1 < c.length && c[i+1] <= prog) i++;
@@ -726,10 +767,25 @@ function showNav(n, dist, next){
   $('navArrow').textContent = round ? '↻' : n.type === 'arrive' ? '⚑' : n.type === 'rejoin' ? '⤴' : '⬆';
   $('navArrow').style.transform = round || n.type === 'arrive' || n.type === 'rejoin' ? '' : `rotate(${MOD_DEG[n.mod] ?? 0}deg)`;
 }
+// 走行済みの道にいて引き直しの経路が無いとき: 次の未走行区間の方向と直線距離を出す
+function showToUncovered(j, p){
+  const a = segXY.a[j], dx = a[0]-p[0], dy = a[1]-p[1], d = Math.hypot(dx, dy);
+  $('navDist').textContent = d >= 1000 ? (d/1000).toFixed(1) + ' km' : roundDist(d) + ' m';
+  $('navText').textContent = '未走行の区間へ向かってください';
+  $('navThen').textContent = 'この道は走行済みです。矢印と距離は次の未走行区間（太い赤線）までの直線';
+  $('navArrow').textContent = '⬆';
+  let rot = moveDir == null ? 0 : Math.atan2(dx, dy) * 180 / Math.PI - (90 - moveDir * 180 / Math.PI);
+  rot = ((rot + 540) % 360) - 180;
+  $('navArrow').style.transform = `rotate(${rot}deg)`;
+}
 function updateNav(lat, lon, p, mainLoc, heading, speed, ts){
   const offThr = Math.max(50, settings.thr * 2);
-  if (mainLoc.d <= offThr){
-    mainProg = mainLoc.prog; offCount = 0;
+  const on = mainLoc.d <= offThr;
+  if (on) mainProg = mainLoc.prog;
+  // 走行済みの道を走っている（走り直しのあと・戻り道）ときは、ルート上でもその通過の右左折は案内せず、未走行区間へ向かう案内にする
+  const tgt = on && passDone(mainProg) ? nextUncovered(mainProg) : -1, stale = tgt >= 0;
+  if (on && !stale){
+    offCount = 0;
     if (detour){ detour = null; detourLine.setLatLngs([]); switchGuide(mainG); speak('ルートに戻りました'); }
   } else offCount++;
   let g = mainG, prog = mainProg;
@@ -739,9 +795,11 @@ function updateNav(lat, lon, p, mainLoc, heading, speed, ts){
     g = detour; prog = detProg;
   }
   if (offCount >= 3 && ts - lastReroute > 20000){
-    if (settings.reroute) reroute(lat, lon, heading, speed, ts);
+    if (settings.reroute) reroute(lat, lon, heading, speed, ts, stale);
+    else if (stale) lastReroute = ts;
     else { lastReroute = ts; speak('ルートを外れました。ルートに戻ってください'); toast('ルートを外れています（引き直しはオフ）', 4000); }
   }
+  if (stale && !detour){ if (navG) switchGuide(null); showToUncovered(tgt, p); return; }
   if (!g || prog == null){ showNav(null); return; }
   if (navG !== g) switchGuide(g);
   // 通過した案内は 25m 先で次に切り替える。次の角が 60m 以内に続くときは 10m で切り替える（短い区画で次の案内が遅れないように）
@@ -757,12 +815,11 @@ function updateNav(lat, lon, p, mainLoc, heading, speed, ts){
   else if (!announced.far && dist <= 300){ announced.far = true; speak(`${roundDist(dist)}メートル先、${navText(n)}`); }
 }
 // ルート逸脱時: 離脱地点以降で最初の未走行区間の先頭へ戻る経路を引く（元ルートと走行記録はそのまま）
-async function reroute(lat, lon, heading, speed, ts){
+async function reroute(lat, lon, heading, speed, ts, stale){
   lastReroute = ts; offCount = 0;
   ensureSegXY();
-  let j = mainProg == null ? 0 : segIndexAtProg(mainProg);
-  while (j < cur.segs.length && cur.segs[j].c) j++;
-  const target = j < cur.segs.length ? cur.segs[j].a : cur.geometry[cur.geometry.length-1];
+  const j = nextUncovered(mainProg);
+  const target = j >= 0 ? cur.segs[j].a : cur.geometry[cur.geometry.length-1];
   const bearing = (heading != null && !isNaN(heading) && speed > 2) ? `${Math.round(heading)},45;` : ';';
   try {
     const j2 = await fetchJSON(`${osrm(cur)}${lon},${lat};${target[1]},${target[0]}?overview=false&geometries=geojson&steps=true&bearings=${bearing}`);
@@ -772,11 +829,11 @@ async function reroute(lat, lon, heading, speed, ts){
     detour = makeGuide(pr.geom, pr.nav); detProg = 0;
     detour.nav.push({ at: detour.total, type: 'rejoin', mod: '', name: '' });
     detourLine.setLatLngs(pr.geom); switchGuide(detour);
-    speak(`ルートを外れました。${roundDist(pr.distance)}メートル先でルートに戻ります`);
+    speak(stale ? `この道は走行済みです。未走行の区間まで、およそ${roundDist(pr.distance)}メートルです` : `ルートを外れました。${roundDist(pr.distance)}メートル先でルートに戻ります`);
   } catch (e) { toast('引き直しに失敗: ' + e.message, 4000); }
 }
 function clearNav(){
-  detour = null; mainProg = null; detProg = null; offCount = 0; navG = null; navIdx = 0; announced = {}; lastLoc = null;
+  detour = null; mainProg = null; detProg = null; offCount = 0; navG = null; navIdx = 0; announced = {}; lastLoc = null; gapPrev = null; altCount = 0;
   if (detourLine) detourLine.setLatLngs([]);
   if ('speechSynthesis' in window) speechSynthesis.cancel();
 }
@@ -810,6 +867,8 @@ function speak(text){
   speechSynthesis.cancel(); speechSynthesis.speak(u);
 }
 let trail = [], moveDir = null, dirty = false; // trail: 直近の位置(平面座標)
+const GAP = { sec: 15, m: 50 }; // 位置がこの秒数以上届かず、その間にこの距離以上動いていたら「記録が途切れた」とみなす
+let gapPrev = null, altCount = 0;
 function onFix(lat, lon, acc, heading, speed, ts, isSim){
   const ll = [lat, lon];
   lastFix = { ll, acc, ts };
@@ -823,6 +882,12 @@ function onFix(lat, lon, acc, heading, speed, ts, isSim){
   if (settings.follow) map.panTo(ll, { animate: false });
   if (mode !== 'drive' || !cur || !cur.segs.length) return;
 
+  // 位置の記録が途切れていた（画面ロック・別のアプリ・電波の届かない場所）: 知らせて、ルート上の位置を決め直す
+  if (gapPrev && ts - gapPrev.ts > GAP.sec * 1000){
+    const gd = haversine(gapPrev.ll, ll);
+    if (gd > GAP.m){ relocateNow(false); trail = []; moveDir = null; speak(`約${gd >= 1000 ? (gd/1000).toFixed(1) + 'キロ' : roundDist(gd) + 'メートル'}の間、位置を記録できませんでした`); }
+  }
+  gapPrev = { ll, ts };
   if (!isSim) DB.addTrack({ routeId: cur.id, t: ts, lat, lon, acc, spd: speed }).catch(()=>{});
   const tl = trackLine.getLatLngs(); if (tl.length > 5000) tl.shift(); tl.push(ll); trackLine.setLatLngs(tl);
 
@@ -844,7 +909,14 @@ function onFix(lat, lon, acc, heading, speed, ts, isSim){
   const path = trail.concat([p]);
   // ルート上の現在位置。ルートに乗っているときは、その前後の区間だけを判定対象にする（同じ向きで 2 回通る区間の 2 回目を残す）
   // 停止中（moveMin 未満の動き）は GPS がゆらぐだけなので、ルート上の位置は前回のまま据え置く
-  const mainLoc = (!advanced && mainProg != null && lastLoc && lastLoc.g === mainG) ? lastLoc.loc : locate(mainG, p, mainProg, true, moveDir);
+  let mainLoc = (!advanced && mainProg != null && lastLoc && lastLoc.g === mainG) ? lastLoc.loc : locate(mainG, p, mainProg, true, moveDir);
+  // 今いる通過がこの先も走行済みで、すぐそばを同じ向きに通る未走行区間がある状態が続いたら、未走行のほうにいるとみなす。
+  // 走り直しや戻り道のあと、同じ道の走行済みの通過に張り付いて案内がずれ、区間が緑にならないのを防ぐ
+  if (advanced){
+    const alt = mainLoc.prog != null && mainLoc.d <= Math.max(50, thr * 2) && passDone(mainLoc.prog) ? uncoveredHere(p, moveDir, thr) : null;
+    if (!alt) altCount = 0;
+    else if (++altCount >= (detour ? 2 : 3)){ mainLoc = alt; altCount = 0; }
+  }
   lastLoc = { g: mainG, loc: mainLoc };
   const onRoute = mainLoc.prog != null && mainLoc.d <= Math.max(50, thr * 2);
   const lo = onRoute ? segIndexAtProg(mainLoc.prog - COV.back) : 0;
@@ -881,7 +953,7 @@ async function startDrive(){
     err => { $('gpsPill').className = 'pill bad'; $('gpsText').textContent = 'GPS エラー: ' + (err.code === 1 ? '位置情報の許可が必要です' : err.message); },
     { enableHighAccuracy: true, maximumAge: 1000, timeout: 20000 }
   );
-  requestWakeLock();
+  wakeWarned = false; requestWakeLock();
   setFollow(true);
 }
 function stopDrive(){
@@ -892,10 +964,27 @@ function stopDrive(){
   setMode('view');
   persist();
 }
+// 画面の点灯維持。別のアプリに切り替えたり画面を消したりすると端末側で解除されるので、
+// 解除を検知して、画面に戻ったとき・一定間隔ごとに掛け直す。掛けられないときは画面と音声で知らせる
+let wakeBusy = false, wakeWarned = false;
+function renderWake(){ $('wakePill').classList.toggle('show', mode === 'drive' && !sim && !wakeLock); }
 async function requestWakeLock(){
-  try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch(e){}
+  if (mode !== 'drive' || sim || wakeBusy || document.visibilityState !== 'visible') return;
+  if (wakeLock && !wakeLock.released) return;
+  wakeLock = null; wakeBusy = true;
+  try {
+    if ('wakeLock' in navigator){
+      const w = await navigator.wakeLock.request('screen');
+      if (mode !== 'drive') w.release().catch(()=>{});
+      else { wakeLock = w; w.addEventListener('release', () => { if (wakeLock === w) wakeLock = null; renderWake(); }); }
+    }
+  } catch(e){}
+  wakeBusy = false;
+  renderWake();
+  if (mode === 'drive' && !wakeLock && !wakeWarned){ wakeWarned = true; speak('画面の点灯を維持できません。端末の自動ロックをオフにしてください'); }
 }
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && mode === 'drive' && !wakeLock) requestWakeLock(); });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') requestWakeLock(); });
+setInterval(requestWakeLock, 15000);
 
 /* ---------- シミュレーション ---------- */
 function startSim(){
@@ -933,6 +1022,7 @@ function setMode(m){
   $('driveBtn').className = m === 'drive' ? 'ng' : 'primary';
   $('editBtn').disabled = m === 'drive';
   $('routeSel').disabled = m !== 'view';
+  renderWake();
   if (m === 'edit'){ $('profileSel').value = cur.profile || 'car'; $('editHint').textContent = cur.distance ? `ルート長 ${(cur.distance/1000).toFixed(1)} km（${PROFILE_JA[cur.profile||'car']}）。タップで経由地を追加、ピンはドラッグで移動、タップで削除。` : '地図をタップして経由地を順に追加。ピンはドラッグで移動、タップで削除。道路に沿ったルートを自動生成します。'; }
   renderRoute(false);
 }
@@ -1187,6 +1277,7 @@ $('undoBtn').onclick = () => { if (cur.waypoints.length){ cur.waypoints.pop(); r
 $('clearBtn').onclick = () => { if (confirm('経由地をすべて消しますか？')){ cur.waypoints = []; recomputeRoute(); } };
 $('driveBtn').onclick = () => mode === 'drive' ? stopDrive() : startDrive();
 $('followBtn').onclick = () => setFollow(!settings.follow);
+$('relocBtn').onclick = () => { if (mode === 'drive') relocateNow(true); };
 $('menuBtn').onclick = () => { $('menuTitle').textContent = cur ? cur.name : 'メニュー'; renderNet(); $('menu').classList.add('open'); };
 $('menu').onclick = async e => {
   if (e.target === $('menu')) return $('menu').classList.remove('open');
