@@ -193,7 +193,7 @@
 <script src="vendor/leaflet/leaflet.js"></script>
 <script>
 'use strict';
-const VERSION = '2026-11-11.2';
+const VERSION = '2026-11-11.3';
 document.getElementById('ver').textContent = VERSION;
 const STEP_M = 15;            // ルートをこの長さの区間に分割して通過判定する
 // 経路計算サーバー（無料のデモ）。車は一方通行・進入禁止を守る。徒歩は無視して最短で結ぶ
@@ -342,7 +342,7 @@ let routes = [], cur = null, mode = 'view';
 let map, tiles, routeLine, coveredLayer, wpLayer, meMarker, accCircle, trackLine;
 let watchId = null, lastFix = null, wakeLock = null, sim = null, detourLine, nextLine, arrowsW, arrowsD;
 let segXY = null; // 現ルートの区間の平面座標キャッシュ
-let mainG = null, detour = null, mainProg = null, detProg = null, offCount = 0, lastReroute = 0, navG = null, navIdx = 0, announced = {};
+let mainG = null, detour = null, mainProg = null, detProg = null, offCount = 0, lastReroute = 0, navG = null, navIdx = 0, announced = {}, lastLoc = null;
 const $ = id => document.getElementById(id);
 const toast = (msg, ms=2500) => { const t = $('toast'); t.textContent = msg; t.style.display='block'; clearTimeout(t._t); t._t = setTimeout(()=>t.style.display='none', ms); };
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2,6);
@@ -601,28 +601,91 @@ function navText(n){
     default: return `${m || '直進'}${road}`;
   }
 }
-// 案内用の経路オブジェクト: 平面座標・累積距離・案内地点
+// 道路形状から曲がり角を探す定数。経路サーバーは「道なり」と見なした角や経由地の角に案内を出さないので、形状で補う
+const TURN = {
+  step: 5,        // 形状をこの間隔で調べる (m)
+  base: 15,       // 角の前後この距離の向きの差を曲がり角度とする (m)
+  minDeg: 50,     // これ以上曲がる地点を曲がり角とみなす（緩いカーブは案内しない）
+  sharpDeg: 125,  // これ以上は「大きく」
+  uturnDeg: 155,  // これ以上は U ターン
+  match: 20,      // 経路サーバーの案内がこの距離以内にあり左右も同じなら、同じ角とみなして補わない (m)
+};
+// 形状上の曲がり角の一覧 [{ at: ルート先頭からの距離, deg: 曲がり角度(左が正) }]
+function geomCorners(xy, cum){
+  const total = cum[cum.length-1], out = [], pts = [];
+  if (!(total >= TURN.step * 2)) return out;
+  let i = 0;
+  for (let s = 0; s <= total; s += TURN.step){
+    while (i + 2 < cum.length && cum[i+1] < s) i++;
+    const l = cum[i+1] - cum[i], t = l ? (s - cum[i]) / l : 0;
+    pts.push([xy[i][0] + (xy[i+1][0]-xy[i][0])*t, xy[i][1] + (xy[i+1][1]-xy[i][1])*t]);
+  }
+  const nb = Math.round(TURN.base / TURN.step); let best = null;
+  for (let k = 1; k + 1 < pts.length; k++){
+    const b = Math.min(nb, k, pts.length-1-k), a = pts[k-b], m = pts[k], c = pts[k+b];
+    let d = (Math.atan2(c[1]-m[1], c[0]-m[0]) - Math.atan2(m[1]-a[1], m[0]-a[0])) * 180 / Math.PI;
+    d = ((d + 540) % 360) - 180;
+    const hit = Math.abs(d) >= TURN.minDeg;
+    if (hit && best && (d > 0) !== (best.deg > 0)){ out.push(best); best = null; } // 左→右と続くクランクは別々の角
+    if (hit){ if (!best || Math.abs(d) > Math.abs(best.deg)) best = { at: k * TURN.step, deg: d }; }
+    else if (best){ out.push(best); best = null; }
+  }
+  if (best) out.push(best);
+  return out;
+}
+// 経路サーバーの案内に、形状から見つけた曲がり角の案内を足して返す（元の nav は書き換えない）
+function addGeomTurns(xy, cum, nav){
+  const used = new Set(), add = [];
+  for (const c of geomCorners(xy, cum)){
+    const side = c.deg > 0 ? 'left' : 'right', ad = Math.abs(c.deg);
+    let hit = -1, round = false;
+    nav.forEach((n, i) => {
+      if (Math.abs(n.at - c.at) > TURN.match || n.type === 'arrive' || n.type === 'rejoin') return;
+      if (/round|rotary/.test(n.type)){ round = true; return; } // ロータリー内のカーブは案内済み
+      if (used.has(i)) return;
+      const mod = n.mod || '';
+      if ((mod === 'uturn' || mod.includes(side)) && (hit < 0 || Math.abs(n.at - c.at) < Math.abs(nav[hit].at - c.at))) hit = i;
+    });
+    if (round) continue;
+    if (hit >= 0){ used.add(hit); continue; }
+    add.push({ at: c.at, type: 'turn', mod: ad >= TURN.uturnDeg ? 'uturn' : (ad >= TURN.sharpDeg ? 'sharp ' : '') + side, name: '', exit: 0, geo: 1 });
+  }
+  return add.length ? nav.concat(add).sort((a, b) => a.at - b.at) : nav;
+}
+// 案内用の経路オブジェクト: 平面座標・累積距離・区間の向き・案内地点（形状から補った右左折を含む）
 function makeGuide(geom, nav){
   if (!geom.length) return null;
   const o = geom[0], xy = geom.map(q => toXY(q[0], q[1], o)), cum = [0];
   for (let i = 1; i < geom.length; i++) cum.push(cum[i-1] + Math.hypot(xy[i][0]-xy[i-1][0], xy[i][1]-xy[i-1][1]));
-  return { geom, o, xy, cum, nav, total: cum[cum.length-1] };
+  const dir = []; for (let i = 0; i + 1 < xy.length; i++) dir.push(cum[i+1] > cum[i] ? Math.atan2(xy[i+1][1]-xy[i][1], xy[i+1][0]-xy[i][0]) : null);
+  return { geom, o, xy, cum, dir, nav: addGeomTurns(xy, cum, nav || []), total: cum[cum.length-1] };
 }
 function progOn(g, i, p){
   const a = g.xy[i], b = g.xy[i+1], vx = b[0]-a[0], vy = b[1]-a[1], l2 = vx*vx+vy*vy;
   let t = l2 ? ((p[0]-a[0])*vx + (p[1]-a[1])*vy) / l2 : 0; t = Math.max(0, Math.min(1, t));
   return g.cum[i] + t * Math.sqrt(l2);
 }
-// 経路上の現在位置(先頭からの距離)。往復で同じ道を通る場合は前回位置から前に進む候補を優先する
-function locate(g, p, prevProg, preferUncovered){
+const LOC = {
+  dirTolDeg: 100, // 現在地の候補: 走行方向と区間の向きの差がこの角度を超える区間（＝逆向きの通過）は候補にしない
+  backTol: 30,    // 現在地の候補: この距離までの後退は GPS のゆらぎとして今の通過にとどまる (m)
+};
+// 経路上の現在位置(先頭からの距離)。往復で同じ道を通る場合は前回位置から前に進む候補を優先する。
+// dir: 走行方向 (rad、不明なら null)。分かっているときは逆向きに通る区間を候補から外す
+function locate(g, p, prevProg, preferUncovered, dir){
   if (!g || g.xy.length < 2) return { d: Infinity, prog: null };
   let minD = Infinity, best = -1; const ds = new Array(g.xy.length - 1);
   for (let i = 0; i + 1 < g.xy.length; i++){ const d = distPointSeg(p, g.xy[i], g.xy[i+1]); ds[i] = d; if (d < minD){ minD = d; best = i; } }
+  const dirTol = LOC.dirTolDeg * Math.PI / 180;
+  const dirOk = i => { const sd = g.dir && g.dir[i]; if (sd == null) return true; let dd = Math.abs(sd - dir); if (dd > Math.PI) dd = 2*Math.PI - dd; return dd <= dirTol; };
+  let useDir = false; // 向きの合う候補が 1 つも無いとき（向きの推定が古い等）は向きを見ない
+  if (dir != null) for (let i = 0; i + 1 < g.xy.length; i++) if (ds[i] <= minD + 20 && dirOk(i)){ useDir = true; break; }
+  const cand = i => ds[i] <= minD + 20 && (!useDir || dirOk(i));
+  if (useDir && !dirOk(best)){ let bd = Infinity; for (let i = 0; i + 1 < g.xy.length; i++) if (cand(i) && ds[i] < bd){ bd = ds[i]; best = i; } }
   if (prevProg == null && preferUncovered && segXY){
     // 初回の位置決め: 近い候補が複数あるとき（往復・周回で同じ道を通る）、まだ通過していない区間のうち一番手前を選ぶ。
     // 全部通過済みなら一番手前。出発地＝到着地のルートで終点側と判定されるのを防ぐ
     let first = -1, firstUncovered = -1;
-    for (let i = 0; i + 1 < g.xy.length; i++) if (ds[i] <= minD + 20){
+    for (let i = 0; i + 1 < g.xy.length; i++) if (cand(i)){
       if (first < 0) first = i;
       if (firstUncovered < 0 && !cur.segs[segIndexAtProg(progOn(g, i, p))].c){ firstUncovered = i; break; }
     }
@@ -630,15 +693,15 @@ function locate(g, p, prevProg, preferUncovered){
   }
   if (prevProg != null){
     // 近い候補が複数あるとき（往復・周回で同じ道を通る）の選び方:
-    //  1) 前回位置から 500m 以内の前進候補があればその中で一番近いもの（わずかな後退はゆらぎとして許容、ただし前進より不利）
+    //  1) 前回位置から 500m 以内の前進候補があればその中で一番近いもの（backTol までの後退はゆらぎとして許容、ただし前進より不利）
     //  2) なければ一番後退が少ないもの（運転者が実際に引き返した場合）
     //  3) それもなければ遠くの前進候補
     // 同じ道を逆向きに通る区間で一度「逆走」と誤判定しても、次の fix で前進候補が優先されるので自然に戻る
     let fwd = -1, fwdScore = Infinity, back = -1, backScore = Infinity, far = -1, farScore = Infinity;
-    for (let i = 0; i + 1 < g.xy.length; i++) if (ds[i] <= minD + 20){
+    for (let i = 0; i + 1 < g.xy.length; i++) if (cand(i)){
       const delta = progOn(g, i, p) - prevProg;
-      if (delta >= -5 && delta <= 500){ const sc = delta >= 0 ? delta : 10 - delta * 3; if (sc < fwdScore){ fwdScore = sc; fwd = i; } }
-      else if (delta < -5){ if (-delta < backScore){ backScore = -delta; back = i; } }
+      if (delta >= -LOC.backTol && delta <= 500){ const sc = delta >= 0 ? delta : 10 - delta * 3; if (sc < fwdScore){ fwdScore = sc; fwd = i; } }
+      else if (delta < -LOC.backTol){ if (-delta < backScore){ backScore = -delta; back = i; } }
       else if (delta < farScore){ farScore = delta; far = i; }
     }
     best = fwd >= 0 ? fwd : back >= 0 ? back : far >= 0 ? far : best;
@@ -655,8 +718,10 @@ function switchGuide(g){ navG = g; navIdx = 0; announced = {}; }
 function showNav(n, dist, next){
   if (!n){ $('navDist').textContent = ''; $('navText').textContent = mainProg == null ? 'ルートに向かってください' : '案内はありません'; $('navThen').textContent = ''; $('navArrow').textContent = '⬆'; $('navArrow').style.transform = ''; return; }
   $('navDist').textContent = dist >= 1000 ? (dist/1000).toFixed(1) + ' km' : roundDist(dist) + ' m';
-  $('navText').textContent = navText(n);
-  $('navThen').textContent = next ? 'その後 ' + navText(next) : '';
+  // 次の角がすぐ（80m 未満）のときは 2 つ並べて出す。狭い区画で「左折してすぐ右折」を先に伝える
+  const gap = next ? next.at - n.at : Infinity;
+  $('navText').textContent = gap < 80 ? `${navText(n)} → ${navText(next)}` : navText(n);
+  $('navThen').textContent = !next ? '' : gap < 80 ? `曲がって ${roundDist(gap)} m 先で${navText(next)}` : 'その後 ' + navText(next);
   const round = n.type.includes('round') || n.type.includes('rotary');
   $('navArrow').textContent = round ? '↻' : n.type === 'arrive' ? '⚑' : n.type === 'rejoin' ? '⤴' : '⬆';
   $('navArrow').style.transform = round || n.type === 'arrive' || n.type === 'rejoin' ? '' : `rotate(${MOD_DEG[n.mod] ?? 0}deg)`;
@@ -679,7 +744,9 @@ function updateNav(lat, lon, p, mainLoc, heading, speed, ts){
   }
   if (!g || prog == null){ showNav(null); return; }
   if (navG !== g) switchGuide(g);
-  while (navIdx < g.nav.length && g.nav[navIdx].at - prog < -25){ navIdx++; announced = {}; }
+  // 通過した案内は 25m 先で次に切り替える。次の角が 60m 以内に続くときは 10m で切り替える（短い区画で次の案内が遅れないように）
+  const passM = i => { const nx = g.nav[i+1]; return nx && nx.at - g.nav[i].at < 60 ? 10 : 25; };
+  while (navIdx < g.nav.length && g.nav[navIdx].at - prog < -passM(navIdx)){ navIdx++; announced = {}; }
   while (navIdx > 0 && g.nav[navIdx-1].at - prog > 25){ navIdx--; announced = {}; }
   const n = g.nav[navIdx];
   if (!n){ showNav(null); return; }
@@ -709,7 +776,7 @@ async function reroute(lat, lon, heading, speed, ts){
   } catch (e) { toast('引き直しに失敗: ' + e.message, 4000); }
 }
 function clearNav(){
-  detour = null; mainProg = null; detProg = null; offCount = 0; navG = null; navIdx = 0; announced = {};
+  detour = null; mainProg = null; detProg = null; offCount = 0; navG = null; navIdx = 0; announced = {}; lastLoc = null;
   if (detourLine) detourLine.setLatLngs([]);
   if ('speechSynthesis' in window) speechSynthesis.cancel();
 }
@@ -776,7 +843,9 @@ function onFix(lat, lon, acc, heading, speed, ts, isSim){
   // 判定線: 直近の軌跡＋今回位置の折れ線。前回ゆらぎで弾いた区間も次の fix で拾える
   const path = trail.concat([p]);
   // ルート上の現在位置。ルートに乗っているときは、その前後の区間だけを判定対象にする（同じ向きで 2 回通る区間の 2 回目を残す）
-  const mainLoc = locate(mainG, p, mainProg, true);
+  // 停止中（moveMin 未満の動き）は GPS がゆらぐだけなので、ルート上の位置は前回のまま据え置く
+  const mainLoc = (!advanced && mainProg != null && lastLoc && lastLoc.g === mainG) ? lastLoc.loc : locate(mainG, p, mainProg, true, moveDir);
+  lastLoc = { g: mainG, loc: mainLoc };
   const onRoute = mainLoc.prog != null && mainLoc.d <= Math.max(50, thr * 2);
   const lo = onRoute ? segIndexAtProg(mainLoc.prog - COV.back) : 0;
   const hi = onRoute ? segIndexAtProg(mainLoc.prog + COV.ahead) : cur.segs.length - 1;
